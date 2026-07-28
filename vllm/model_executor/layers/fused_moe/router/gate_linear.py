@@ -63,11 +63,21 @@ class GateLinear(ReplicatedLinear):
         can_use_specialized_kernels = (
             current_platform.is_cuda() and (is_hopper or is_blackwell) and not bias
         )
+        # AITER's tuned GEMM multiplies bf16 operands and writes fp32 directly,
+        # so on gfx950 fp32 routing does not require fp32 weights either.
+        can_use_aiter_tuned_gemm = (
+            not bias
+            and current_platform.is_rocm()
+            and bool(rocm_aiter_ops.is_tgemm_enabled())
+        )
 
         # If fp32 compute is required and no specialized kernel is available,
         # store weights in fp32 so the fallback linear path computes in fp32.
+        # With a specialized kernel the accumulation is fp32 regardless, so
+        # bf16 weights are kept -- they avoid upcasting the activation on every
+        # call and keep the GEMM off the much slower fp32 path.
         if force_fp32_compute and not can_use_specialized_kernels:
-            params_dtype = torch.float32
+            params_dtype = torch.bfloat16 if can_use_aiter_tuned_gemm else torch.float32
 
         super().__init__(
             input_size,
@@ -141,14 +151,13 @@ class GateLinear(ReplicatedLinear):
         # AITER tuned GEMM eligibility (ROCm gfx950, bf16 weight).
         # The router gate is a skinny GEMM (M=num_tokens, N=num_experts,
         # K=hidden_size); AITER's tuned kernel beats the generic ROCm
-        # unquantized path, which lands on the skinny-GEMM fallback and then
-        # needs a separate cast when out_dtype differs from the weight dtype.
+        # unquantized path, which for an fp32 gate skips every skinny-GEMM
+        # kernel and runs the GEMM in fp32 behind a per-call activation upcast.
         self.allow_aiter_router_gemm = (
-            not bias
-            and current_platform.is_rocm()
-            and bool(rocm_aiter_ops.is_tgemm_enabled())
-            and self.weight.dtype == torch.bfloat16
+            can_use_aiter_tuned_gemm and self.weight.dtype == torch.bfloat16
         )
+        if self.allow_aiter_router_gemm:
+            logger.info_once("Enabled the AITER tuned GEMM router gate on gfx950.")
 
     def set_out_dtype(self, out_dtype: torch.dtype) -> None:
         """Set output dtype for the router logits after init.

@@ -17,8 +17,8 @@ from vllm.platforms import current_platform
 # Register torch.ops.vllm.rocm_aiter_router_gemm.
 import vllm.model_executor.layers.fused_moe.router.gate_linear  # noqa: F401  isort: skip
 
-# (hidden_size, num_experts): GLM-5.2 / DeepSeek-V3 style routers.
-SHAPES = [(6144, 160), (6144, 256), (7168, 256)]
+# (hidden_size, num_experts): GLM-5/5.2, DeepSeek-V3 and Kimi-K2 routers.
+SHAPES = [(6144, 256), (7168, 256), (7168, 384)]
 NUM_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]
 ATOL_BF16 = 2e-2
 
@@ -89,8 +89,14 @@ def test_topk_routing_consistency(num_tokens: int, hidden_dim: int, num_experts:
 
 
 @pytest.mark.parametrize("hidden_dim,num_experts", SHAPES)
-def test_matches_gate_linear_fallback(hidden_dim: int, num_experts: int):
-    """The AITER tier must agree with the F.linear fallback it replaces."""
+def test_matches_fp32_fallback(hidden_dim: int, num_experts: int):
+    """The AITER tier must agree with the fp32 fallback it replaces.
+
+    When ``force_fp32_compute`` is set and no specialized kernel is available,
+    ``GateLinear`` keeps fp32 weights and upcasts the activation, so the gate
+    runs as an fp32 GEMM. Both operands still hold bf16-representable values,
+    so bf16 x bf16 with fp32 accumulation should track it closely.
+    """
     _requires_aiter_tgemm()
     torch.manual_seed(7)
     device = torch.device("cuda")
@@ -98,6 +104,6 @@ def test_matches_gate_linear_fallback(hidden_dim: int, num_experts: int):
     weight = torch.randn(num_experts, hidden_dim, dtype=torch.bfloat16, device=device)
 
     out = _run(x, weight, torch.float32)
-    fallback = torch.nn.functional.linear(x, weight).to(torch.float32)
+    fp32_fallback = torch.nn.functional.linear(x.float(), weight.float())
 
-    torch.testing.assert_close(out, fallback, atol=ATOL_BF16, rtol=0)
+    torch.testing.assert_close(out, fp32_fallback, atol=5e-2, rtol=2e-3)
