@@ -235,7 +235,7 @@ class GateLinear(ReplicatedLinear):
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return output, None
 
-        # Tier 6: AITER tuned GEMM (ROCm), bf16×bf16 accumulating into out_dtype
+        # Tier 6: AITER tuned GEMM (ROCm), tuned bf16 kernel cast to out_dtype
         if self.allow_aiter_router_gemm and x.dtype == torch.bfloat16:
             output = torch.ops.vllm.rocm_aiter_router_gemm(
                 x,
@@ -305,10 +305,18 @@ def rocm_aiter_router_gemm_impl(
 
     Wrapped in a custom op so torch.compile treats the AITER tuned-config
     lookup as opaque instead of specializing on it.
+
+    AITER keys its tuned configs on the output dtype as well as the shape, and
+    for the router gate it only ships bf16-output entries. Asking for out_dtype
+    directly therefore misses the table whenever the router runs in fp32 and
+    falls back to an untuned solution, so take the tuned bf16 kernel and cast.
+    The cast is over the gate's tiny output (num_tokens x num_experts), and it
+    costs less than the untuned GEMM it avoids.
     """
     from aiter.tuned_gemm import tgemm
 
-    return tgemm.mm(x, weight, None, otype=out_dtype)
+    out = tgemm.mm(x, weight, None)
+    return out if out.dtype == out_dtype else out.to(out_dtype)
 
 
 def rocm_aiter_router_gemm_fake(
