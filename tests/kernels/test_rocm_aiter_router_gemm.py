@@ -8,11 +8,12 @@ is a float64 matmul; what ultimately matters is that numeric error never flips
 the top-k expert selection by more than the kernel's own error.
 
 The tier runs AITER's tuned bf16 kernel and casts, so the result carries bf16
-output precision even when ``out_dtype`` is fp32. Absolute error therefore
-scales with the output magnitude, which itself grows as sqrt(hidden_size) for
-unit-variance inputs. Tolerances below are expressed as a fraction of the
-largest reference logit so they hold across all three shapes rather than being
-tuned per shape.
+output precision even when ``out_dtype`` is fp32, and the tuned kernels for
+these shapes reduce over split-K, which contributes more error than that
+rounding does. Either way the absolute error scales with the output magnitude,
+which itself grows as sqrt(hidden_size) for unit-variance inputs. Tolerances
+below are expressed as a fraction of the largest reference logit so they hold
+across all three shapes rather than being tuned per shape.
 """
 
 import pytest
@@ -126,7 +127,9 @@ def test_matches_fp32_fallback(hidden_dim: int, num_experts: int, num_tokens: in
     When ``force_fp32_compute`` is set and no specialized kernel is available,
     ``GateLinear`` keeps fp32 weights and upcasts the activation, so the gate
     runs as an fp32 GEMM. Both operands still hold bf16-representable values, so
-    the only real difference is that this tier rounds its output to bf16.
+    the differences are in the reduction and the output: the tuned kernel
+    accumulates over split-K rather than in one fp32 pass, which dominates, and
+    the result is rounded to bf16 before the cast.
     """
     _requires_aiter_tgemm()
     torch.manual_seed(7)
