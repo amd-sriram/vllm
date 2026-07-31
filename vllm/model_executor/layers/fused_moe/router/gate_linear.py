@@ -25,9 +25,9 @@ class GateLinear(ReplicatedLinear):
     3. fp32 specialized kernel  (SM90+, bf16/fp32 in, fp32 out, M<=32,
        (H, E) in {(3072, 256), (6144, 128), (6144, 256)})
     4. experimental bf16x3 CuteDSL kernel (opt-in, SM100, bf16 in, fp32 weight)
-    5. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
-    6. AITER tuned GEMM (ROCm gfx950, bf16 weight)
-    7. F.linear via ReplicatedLinear (ultimate fallback)
+    5. bf16×bf16→fp32 GEMM: cuBLAS (SM90+ + bf16 weight + fp32 out_dtype)
+       or AITER tuned GEMM (ROCm gfx950, bf16 weight)
+    6. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
     (e.g. when the required dtype depends on the expert quantization
@@ -223,21 +223,22 @@ class GateLinear(ReplicatedLinear):
             output = bf16x3_router_gemm(x, self.weight)
             return output, None
 
-        # Tier 5: cuBLAS bf16→fp32
-        if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
-            output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
-            return output, None
+        # Tier 5: bf16→fp32 GEMM, cuBLAS on CUDA or the AITER tuned GEMM on ROCm.
+        # At most one is ever eligible: cuBLAS needs is_cuda(), AITER is_rocm().
+        if x.dtype == torch.bfloat16:
+            if self.allow_cublas_router_gemm:
+                output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+                return output, None
 
-        # Tier 6: AITER tuned GEMM (ROCm)
-        if self.allow_aiter_router_gemm and x.dtype == torch.bfloat16:
-            output = torch.ops.vllm.rocm_aiter_router_gemm(
-                x,
-                self.weight,
-                self.out_dtype if self.out_dtype is not None else self.weight.dtype,
-            )
-            return output, None
+            if self.allow_aiter_router_gemm:
+                output = torch.ops.vllm.rocm_aiter_router_gemm(
+                    x,
+                    self.weight,
+                    self.out_dtype if self.out_dtype is not None else self.weight.dtype,
+                )
+                return output, None
 
-        # Tier 7: F.linear (ReplicatedLinear)
+        # Tier 6: F.linear (ReplicatedLinear)
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
         output, output_bias = super().forward(x)
