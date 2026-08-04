@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
@@ -231,10 +232,26 @@ class GateLinear(ReplicatedLinear):
                 return output, None
 
             if self.allow_aiter_router_gemm:
+                out_dtype = (
+                    self.out_dtype
+                    if self.out_dtype is not None
+                    else self.weight.dtype
+                )
+                # AITER only ships bf16-output tuned kernels for the gate's
+                # shapes, so an fp32 out_dtype runs the tuned bf16 GEMM and then
+                # casts the [num_tokens, num_experts] logits to fp32 once per
+                # MoE layer. The ROCm grouped top-k consumes bf16 logits
+                # directly (routing weights are still produced in fp32), so keep
+                # the logits in bf16 and drop that copy when the flag is set.
+                if (
+                    envs.VLLM_ROCM_ROUTER_GEMM_BF16_LOGITS
+                    and out_dtype == torch.float32
+                ):
+                    out_dtype = torch.bfloat16
                 output = torch.ops.vllm.rocm_aiter_router_gemm(
                     x,
                     self.weight,
-                    self.out_dtype if self.out_dtype is not None else self.weight.dtype,
+                    out_dtype,
                 )
                 return output, None
 

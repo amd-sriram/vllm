@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
+    VLLM_ROCM_ROUTER_GEMM_BF16_LOGITS: bool = False
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1274,6 +1275,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
+    ),
+    # Keep the ROCm/AITER MoE router gate GEMM output in bf16 instead of casting
+    # the tiny [num_tokens, num_experts] logits to fp32. AITER only ships
+    # bf16-output tuned kernels for the gate's shapes, so an fp32 request runs
+    # the same tuned kernel and then a per-MoE-layer bf16->fp32 copy. The ROCm
+    # grouped top-k consumes bf16 logits directly (routing weights are still
+    # produced in fp32), so skipping the cast removes that copy per layer.
+    "VLLM_ROCM_ROUTER_GEMM_BF16_LOGITS": lambda: (
+        os.getenv("VLLM_ROCM_ROUTER_GEMM_BF16_LOGITS", "False").lower()
+        in ("true", "1")
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
