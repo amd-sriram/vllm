@@ -109,8 +109,7 @@ def indexer_k_quant_and_cache_triton(
     # In real layout, we store the first portion as kv cache value
     # and second portion as kv cache scale
     kv_cache = kv_cache.view(num_blocks, -1)
-    fp8_dtype = current_platform.fp8_dtype()
-    kv_cache_value = kv_cache[:, : block_size * head_dim].view(fp8_dtype)
+    kv_cache_value = kv_cache[:, : block_size * head_dim].view(FP8_DTYPE)
     kv_cache_scale = kv_cache[:, block_size * head_dim :].view(torch.float32)
     head_tile_size = head_tile_size // kv_cache.element_size()
     layout = "NORMAL" if block_size == 1 else "SHUFFLE"
@@ -128,7 +127,7 @@ def indexer_k_quant_and_cache_triton(
         layout,
         block_tile_size,
         head_tile_size,
-        IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
+        IS_FNUZ=FP8_DTYPE == torch.float8_e4m3fnuz,
         USE_UE8M0=scale_fmt == "ue8m0",
     )
 
@@ -162,7 +161,7 @@ def rocm_aiter_indexer_qk_rope_quant_cache_fake(
     is_neox: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
-        torch.empty(q.shape, dtype=current_platform.fp8_dtype(), device=q.device),
+        torch.empty(q.shape, dtype=FP8_DTYPE, device=q.device),
         torch.empty(weights.shape, dtype=torch.float32, device=weights.device),
     )
 
@@ -186,7 +185,7 @@ def rocm_aiter_indexer_qk_rope_quant_cache(
     """Whole sparse indexer prologue in one AITER launch; writes the K cache."""
     from vllm.utils.torch_utils import _resolve_layer_name
 
-    q_out = torch.empty(q.shape, dtype=current_platform.fp8_dtype(), device=q.device)
+    q_out = torch.empty(q.shape, dtype=FP8_DTYPE, device=q.device)
     weights_out = torch.empty(weights.shape, dtype=torch.float32, device=weights.device)
 
     attn_metadata = get_forward_context().attn_metadata
@@ -325,8 +324,7 @@ def cp_gather_indexer_k_quant_cache_triton(
     num_blocks = k_cache.shape[0]
     # we assume the kv cache already been split to 2 portion
     k_cache = k_cache.view(num_blocks, -1)
-    fp8_dtype = current_platform.fp8_dtype()
-    k_cache_value = k_cache[:, : block_size * head_dim].view(fp8_dtype)
+    k_cache_value = k_cache[:, : block_size * head_dim].view(FP8_DTYPE)
     k_cache_scale = k_cache[:, block_size * head_dim :].view(torch.float32)
     grid = (num_tokens,)
     k_fp8_scale = k_fp8_scale.view(torch.float32)
@@ -365,7 +363,6 @@ def fp8_paged_mqa_logits_torch(
 ):
     from vllm.utils.math_utils import cdiv
 
-    fp8_dtype = current_platform.fp8_dtype()
     batch_size, next_n, _, dim = q.size()
     if next_n == 1:
         block_size = kv_cache.shape[1]
@@ -389,7 +386,7 @@ def fp8_paged_mqa_logits_torch(
             cache = kv_cache_flat[pages]
             scale_offset = block_size * dim
             cache_value = (
-                cache[..., :scale_offset].view(dtype=fp8_dtype).to(torch.float32)
+                cache[..., :scale_offset].view(dtype=FP8_DTYPE).to(torch.float32)
             )
             cache_scale = (
                 cache[..., scale_offset:].view(dtype=torch.float32).contiguous()
@@ -407,7 +404,7 @@ def fp8_paged_mqa_logits_torch(
     kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
     scale = scale.contiguous().view(torch.float)
     q = q.float()
-    kv_cache = kv_cache.view(fp8_dtype).float() * scale
+    kv_cache = kv_cache.view(FP8_DTYPE).float() * scale
     num_block, block_size, _, dim = kv_cache.size()
     logits = torch.full(
         [batch_size * next_n, max_model_len],
