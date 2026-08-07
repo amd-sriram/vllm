@@ -380,6 +380,104 @@ def paged_mqa_logits_module():
     return None
 
 
+_SANITIZE_FLT_MAX = torch.finfo(torch.float32).max
+_SANITIZE_BLOCK = 1024
+# Enough programs to fill the device at batch 1 without over-subscribing at
+# large batch. Derived from the row count, which is a shape, so the grid stays
+# static across steps.
+_SANITIZE_TARGET_PROGRAMS = 2048
+_SANITIZE_MAX_CHUNKS = 32
+# Measured on MI355X (gfx950): the kernel is a flat ~8.7 us regardless of batch
+# or context, of which ~6.3 us is Triton launch overhead (an empty kernel costs
+# the same), while nan_to_num_ over the whole workspace runs at HBM speed, about
+# 1.2 us per million elements. They cross near 7M elements; below that the full
+# scrub is cheaper, so small batches stay on exactly the path they are on today.
+_SANITIZE_MIN_ELEMS = 10 * 1024 * 1024
+
+
+@triton.jit
+def _sanitize_decode_logits_kernel(
+    logits_ptr,
+    seq_lens_ptr,
+    stride_row,
+    stride_col,
+    next_n,
+    FLT_MAX: tl.constexpr,
+    SEQ_LENS_2D: tl.constexpr,
+    BLOCK: tl.constexpr,
+    CHUNKS_PER_ROW: tl.constexpr,
+):
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+
+    # The bound the decode top-k uses, mirrored exactly: row r belongs to batch
+    # element r // next_n and is scanned over [0, seq_len - next_n + r % next_n
+    # + 1). A 2-D seq_lens carries the per-row length directly.
+    if SEQ_LENS_2D:
+        row_end = tl.load(seq_lens_ptr + row)
+    else:
+        row_end = tl.load(seq_lens_ptr + row // next_n) - next_n + (row % next_n) + 1
+    row_end = tl.maximum(row_end, 0)
+
+    base = logits_ptr + row.to(tl.int64) * stride_row
+    for start in range(chunk * BLOCK, row_end, CHUNKS_PER_ROW * BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < row_end
+        ptrs = base + offs.to(tl.int64) * stride_col
+        x = tl.load(ptrs, mask=mask, other=0.0)
+        # torch.nan_to_num_(-inf) semantics: every case is decided against the
+        # original value, so NaN maps to -inf rather than to -FLT_MAX.
+        y = tl.where(x != x, float("-inf"), x)
+        y = tl.where(x == float("inf"), FLT_MAX, y)
+        y = tl.where(x == float("-inf"), -FLT_MAX, y)
+        tl.store(ptrs, y, mask=mask)
+
+
+def sanitize_decode_logits(
+    out_logits: torch.Tensor,
+    context_lens: torch.Tensor,
+    next_n: int,
+) -> None:
+    """NaN/Inf-sanitize the logits the sparse decode top-k will read.
+
+    ``out_logits`` is a ``[rows, max_model_len]`` fp32 workspace buffer that is
+    reused across steps, so the region the paged-MQA-logits kernel does not
+    write still holds values from earlier steps -- including bit patterns that
+    are NaN, which the top-k histogram cannot rank and which leave output slots
+    unwritten (vllm#49714).
+
+    Only the head of each row is ever read: ``top_k_per_row_decode`` scans row
+    ``r`` over ``[0, seq_len[r // next_n] - next_n + r % next_n + 1)``. Bounding
+    the sanitize to that window is therefore equivalent to running it over the
+    whole buffer, but its cost follows the sequences in flight instead of
+    ``max_model_len``. With ``max_model_len`` at 258048 and a 1k-token context
+    that is over 99% less traffic: 73 us drops to 9 us per call at batch 256 on
+    MI355X, worth ~2 ms of TPOT per decode step.
+    """
+    rows = out_logits.shape[0]
+    if rows == 0:
+        return
+    if out_logits.numel() < _SANITIZE_MIN_ELEMS:
+        # Below the crossover the launch costs more than the work it saves.
+        out_logits.nan_to_num_(float("-inf"))
+        return
+    chunks_per_row = max(
+        1, min(_SANITIZE_MAX_CHUNKS, _SANITIZE_TARGET_PROGRAMS // rows)
+    )
+    _sanitize_decode_logits_kernel[(rows, chunks_per_row)](
+        out_logits,
+        context_lens,
+        out_logits.stride(0),
+        out_logits.stride(1),
+        next_n,
+        FLT_MAX=_SANITIZE_FLT_MAX,
+        SEQ_LENS_2D=context_lens.dim() == 2,
+        BLOCK=_SANITIZE_BLOCK,
+        CHUNKS_PER_ROW=chunks_per_row,
+        num_warps=4,
+    )
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -442,7 +540,7 @@ def rocm_fp8_paged_mqa_logits(
                 KVBlockSize=block_size,
                 WavePerEU=2,
             )
-            out_logits.nan_to_num_(float("-inf"))
+            sanitize_decode_logits(out_logits, context_lens, next_n)
             return out_logits
         deepgemm_fp8_paged_mqa_logits_stage1 = (
             aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
