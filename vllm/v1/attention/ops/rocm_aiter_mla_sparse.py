@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from importlib.util import find_spec
 
 import torch
@@ -23,6 +24,10 @@ if current_platform.is_rocm():
 else:
     _ON_GFX942 = False
     _ON_GFX950 = False
+
+_USE_PREFILL_PAGED_MQA_LOGITS = (
+    os.environ.get("VLLM_ROCM_PREFILL_PAGED_MQA_LOGITS", "0") == "1"
+)
 
 
 @triton.jit
@@ -719,45 +724,91 @@ def rocm_aiter_sparse_attn_indexer(
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
 
-        workspace_manager = current_workspace_manager()
-        k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
-            ((total_seq_lens, head_dim), fp8_dtype),
-            ((total_seq_lens, 4), torch.uint8),
+        block_size = kv_cache.shape[1]
+        use_paged_prefill = (
+            _USE_PREFILL_PAGED_MQA_LOGITS
+            and (_ON_GFX942 or _ON_GFX950)
+            and block_size > 1
+            and paged_mqa_logits_module() is not None
         )
-        for chunk in prefill_metadata.chunks:
-            k_fp8 = k_fp8_full[: chunk.total_seq_lens]
-            k_scale = k_scale_full[: chunk.total_seq_lens]
-            cp_gather_indexer_k_quant_cache_triton(
-                kv_cache,
-                k_fp8,
-                k_scale,
-                chunk.block_table,
-                chunk.cu_seq_lens,
-                token_to_seq=chunk.token_to_seq,
-            )
-            logits = rocm_fp8_mqa_logits(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-            )
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
 
-            num_rows = logits.shape[0]
-
-            torch.ops._C.top_k_per_row_prefill(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
+        if use_paged_prefill:
+            kv_cache_4d = kv_cache.unsqueeze(-2)
+            for chunk in prefill_metadata.chunks:
+                chunk_tokens = chunk.token_end - chunk.token_start
+                q_chunk = q_fp8[chunk.token_start : chunk.token_end].unsqueeze(1)
+                context_lens = (
+                    chunk.cu_seqlen_ke - chunk.cu_seqlen_ks
+                ).to(torch.int32)
+                expanded_block_tables = chunk.block_table[
+                    chunk.token_to_seq.long()
+                ]
+                logits = rocm_fp8_paged_mqa_logits(
+                    q_chunk,
+                    kv_cache_4d,
+                    weights[chunk.token_start : chunk.token_end],
+                    context_lens,
+                    expanded_block_tables,
+                    None,
+                    max_model_len=max_model_len,
+                )
+                topk_indices = topk_indices_buffer[
+                    chunk.token_start : chunk.token_end, :topk_tokens
+                ]
+                num_rows = logits.shape[0]
+                cu_ks = torch.zeros(
+                    num_rows, dtype=torch.int32, device=logits.device
+                )
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    cu_ks,
+                    context_lens,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
+        else:
+            workspace_manager = current_workspace_manager()
+            k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
+                ((total_seq_lens, head_dim), fp8_dtype),
+                ((total_seq_lens, 4), torch.uint8),
             )
+            for chunk in prefill_metadata.chunks:
+                k_fp8 = k_fp8_full[: chunk.total_seq_lens]
+                k_scale = k_scale_full[: chunk.total_seq_lens]
+                cp_gather_indexer_k_quant_cache_triton(
+                    kv_cache,
+                    k_fp8,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                    token_to_seq=chunk.token_to_seq,
+                )
+                logits = rocm_fp8_mqa_logits(
+                    q_fp8[chunk.token_start : chunk.token_end],
+                    (k_fp8, k_scale.view(torch.float32)),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+                topk_indices = topk_indices_buffer[
+                    chunk.token_start : chunk.token_end, :topk_tokens
+                ]
+
+                num_rows = logits.shape[0]
+
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
