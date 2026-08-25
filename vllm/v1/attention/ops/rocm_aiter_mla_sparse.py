@@ -479,11 +479,11 @@ _SANITIZE_BLOCK = 1024
 # static across steps.
 _SANITIZE_TARGET_PROGRAMS = 2048
 _SANITIZE_MAX_CHUNKS = 32
-# Measured on MI355X (gfx950): the kernel is a flat ~8.7 us regardless of batch
-# or context, of which ~6.3 us is Triton launch overhead (an empty kernel costs
-# the same), while nan_to_num_ over the whole workspace runs at HBM speed, about
-# 1.2 us per million elements. They cross near 7M elements; below that the full
-# scrub is cheaper, so small batches stay on exactly the path they are on today.
+# Measured on MI355X (gfx950): the kernel is launch-bound and flat at ~4.6 us
+# regardless of batch or context (an empty kernel costs about the same), while
+# nan_to_num_ over the whole workspace runs at HBM speed, about 1.2 us per
+# million elements. They cross near 7M elements; below that the full scrub is
+# cheaper, so small batches stay on exactly the path they are on today.
 _SANITIZE_MIN_ELEMS = 10 * 1024 * 1024
 
 
@@ -543,8 +543,9 @@ def sanitize_decode_logits(
     the sanitize to that window is therefore equivalent to running it over the
     whole buffer, but its cost follows the sequences in flight instead of
     ``max_model_len``. With ``max_model_len`` at 258048 and a 1k-token context
-    that is over 99% less traffic: 73 us drops to 9 us per call at batch 256 on
-    MI355X, worth ~2 ms of TPOT per decode step.
+    that is over 99% less traffic: measured on MI355X at batch 256, 43.1 us
+    drops to 4.6 us per call, or 426 ms down to 52 ms of GPU time over a
+    1024/256 serving run (1.82% of GPU kernel time down to 0.21%).
     """
     rows = out_logits.shape[0]
     if rows == 0:
