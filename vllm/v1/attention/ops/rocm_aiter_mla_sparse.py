@@ -476,7 +476,7 @@ _SANITIZE_FLT_MAX = torch.finfo(torch.float32).max
 _SANITIZE_BLOCK = 1024
 _SANITIZE_TARGET_PROGRAMS = 2048
 _SANITIZE_MAX_CHUNKS = 32
-# Below this the full nan_to_num_ scrub is cheaper than a kernel launch.
+# Below this the full nan_to_num_ is cheaper than a kernel launch.
 _SANITIZE_MIN_ELEMS = 10 * 1024 * 1024
 
 
