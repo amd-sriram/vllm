@@ -4,6 +4,7 @@ import functools
 import importlib
 import math
 from importlib.util import find_spec
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -684,8 +685,32 @@ def fp8_mqa_logits_torch(
     return logits
 
 
+def _flydsl_mqa_logits_module():
+    """aiter's FlyDSL prefill MQA-logits kernel, wrapped to look like the
+    Triton/Gluon module, or None if it is unavailable here.
+
+    ROCm/aiter#4538 adds a gfx950 FlyDSL implementation whose launcher takes
+    the same arguments as `fp8_mqa_logits`, so exposing it under that name is
+    enough to swap the two. It stays opt-in while the PR is unmerged, and is
+    gfx950-only: the kernel is written against that ISA, so any other
+    architecture keeps the Triton/Gluon module.
+    """
+    if not _ON_GFX950:
+        return None
+    try:
+        from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+    except ImportError:
+        return None
+    return SimpleNamespace(fp8_mqa_logits=flydsl_fp8_mqa_logits)
+
+
 @functools.lru_cache
 def mqa_logits_module():
+    if envs.VLLM_ROCM_USE_AITER_FLYDSL_MQA_LOGITS:
+        flydsl_module = _flydsl_mqa_logits_module()
+        if flydsl_module is not None:
+            return flydsl_module
+
     mqa_logits_module_path = None
     if find_spec("aiter.ops.triton.fp8_mqa_logits") is not None:
         mqa_logits_module_path = "aiter.ops.triton.fp8_mqa_logits"
