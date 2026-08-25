@@ -474,16 +474,9 @@ def paged_mqa_logits_module():
 
 _SANITIZE_FLT_MAX = torch.finfo(torch.float32).max
 _SANITIZE_BLOCK = 1024
-# Enough programs to fill the device at batch 1 without over-subscribing at
-# large batch. Derived from the row count, which is a shape, so the grid stays
-# static across steps.
 _SANITIZE_TARGET_PROGRAMS = 2048
 _SANITIZE_MAX_CHUNKS = 32
-# Measured on MI355X (gfx950): the kernel is launch-bound and flat at ~4.6 us
-# regardless of batch or context (an empty kernel costs about the same), while
-# nan_to_num_ over the whole workspace runs at HBM speed, about 1.2 us per
-# million elements. They cross near 7M elements; below that the full scrub is
-# cheaper, so small batches stay on exactly the path they are on today.
+# Below this the full nan_to_num_ scrub is cheaper than a kernel launch.
 _SANITIZE_MIN_ELEMS = 10 * 1024 * 1024
 
 
@@ -502,9 +495,7 @@ def _sanitize_decode_logits_kernel(
     row = tl.program_id(0)
     chunk = tl.program_id(1)
 
-    # The bound the decode top-k uses, mirrored exactly: row r belongs to batch
-    # element r // next_n and is scanned over [0, seq_len - next_n + r % next_n
-    # + 1). A 2-D seq_lens carries the per-row length directly.
+    # Mirror top_k_per_row_decode's read bound exactly.
     if SEQ_LENS_2D:
         row_end = tl.load(seq_lens_ptr + row)
     else:
@@ -517,9 +508,7 @@ def _sanitize_decode_logits_kernel(
         mask = offs < row_end
         ptrs = base + offs.to(tl.int64) * stride_col
         x = tl.load(ptrs, mask=mask, other=0.0)
-        # torch.nan_to_num_(-inf) semantics: every case is decided against the
-        # original value, so NaN maps to -inf rather than to -FLT_MAX.
-        y = tl.where(x != x, float("-inf"), x)
+        y = tl.where(x != x, float("-inf"), x)  # NaN -> -inf (not -FLT_MAX)
         y = tl.where(x == float("inf"), FLT_MAX, y)
         y = tl.where(x == float("-inf"), -FLT_MAX, y)
         tl.store(ptrs, y, mask=mask)
@@ -530,28 +519,11 @@ def sanitize_decode_logits(
     context_lens: torch.Tensor,
     next_n: int,
 ) -> None:
-    """NaN/Inf-sanitize the logits the sparse decode top-k will read.
-
-    ``out_logits`` is a ``[rows, max_model_len]`` fp32 workspace buffer that is
-    reused across steps, so the region the paged-MQA-logits kernel does not
-    write still holds values from earlier steps -- including bit patterns that
-    are NaN, which the top-k histogram cannot rank and which leave output slots
-    unwritten (vllm#49714).
-
-    Only the head of each row is ever read: ``top_k_per_row_decode`` scans row
-    ``r`` over ``[0, seq_len[r // next_n] - next_n + r % next_n + 1)``. Bounding
-    the sanitize to that window is therefore equivalent to running it over the
-    whole buffer, but its cost follows the sequences in flight instead of
-    ``max_model_len``. With ``max_model_len`` at 258048 and a 1k-token context
-    that is over 99% less traffic: measured on MI355X at batch 256, 43.1 us
-    drops to 4.6 us per call, or 426 ms down to 52 ms of GPU time over a
-    1024/256 serving run (1.82% of GPU kernel time down to 0.21%).
-    """
+    """Sanitize only the window top_k_per_row_decode reads (vllm#49714)."""
     rows = out_logits.shape[0]
     if rows == 0:
         return
     if out_logits.numel() < _SANITIZE_MIN_ELEMS:
-        # Below the crossover the launch costs more than the work it saves.
         out_logits.nan_to_num_(float("-inf"))
         return
     chunks_per_row = max(
