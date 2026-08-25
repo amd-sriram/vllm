@@ -472,16 +472,16 @@ def paged_mqa_logits_module():
     return None
 
 
-_SANITIZE_FLT_MAX = torch.finfo(torch.float32).max
-_SANITIZE_BLOCK = 1024
-_SANITIZE_TARGET_PROGRAMS = 2048
-_SANITIZE_MAX_CHUNKS = 32
+_SCRUB_FLT_MAX = torch.finfo(torch.float32).max
+_SCRUB_BLOCK = 1024
+_SCRUB_TARGET_PROGRAMS = 2048
+_SCRUB_MAX_CHUNKS = 32
 # Below this the full nan_to_num_ scrub is cheaper than a kernel launch.
-_SANITIZE_MIN_ELEMS = 10 * 1024 * 1024
+_SCRUB_MIN_ELEMS = 10 * 1024 * 1024
 
 
 @triton.jit
-def _sanitize_decode_logits_kernel(
+def _scrub_decode_logits_kernel(
     logits_ptr,
     seq_lens_ptr,
     stride_row,
@@ -514,7 +514,7 @@ def _sanitize_decode_logits_kernel(
         tl.store(ptrs, y, mask=mask)
 
 
-def sanitize_decode_logits(
+def scrub_decode_logits(
     out_logits: torch.Tensor,
     context_lens: torch.Tensor,
     next_n: int,
@@ -523,21 +523,19 @@ def sanitize_decode_logits(
     rows = out_logits.shape[0]
     if rows == 0:
         return
-    if out_logits.numel() < _SANITIZE_MIN_ELEMS:
+    if out_logits.numel() < _SCRUB_MIN_ELEMS:
         out_logits.nan_to_num_(float("-inf"))
         return
-    chunks_per_row = max(
-        1, min(_SANITIZE_MAX_CHUNKS, _SANITIZE_TARGET_PROGRAMS // rows)
-    )
-    _sanitize_decode_logits_kernel[(rows, chunks_per_row)](
+    chunks_per_row = max(1, min(_SCRUB_MAX_CHUNKS, _SCRUB_TARGET_PROGRAMS // rows))
+    _scrub_decode_logits_kernel[(rows, chunks_per_row)](
         out_logits,
         context_lens,
         out_logits.stride(0),
         out_logits.stride(1),
         next_n,
-        FLT_MAX=_SANITIZE_FLT_MAX,
+        FLT_MAX=_SCRUB_FLT_MAX,
         SEQ_LENS_2D=context_lens.dim() == 2,
-        BLOCK=_SANITIZE_BLOCK,
+        BLOCK=_SCRUB_BLOCK,
         CHUNKS_PER_ROW=chunks_per_row,
         num_warps=4,
     )
@@ -605,7 +603,7 @@ def rocm_fp8_paged_mqa_logits(
                 KVBlockSize=block_size,
                 WavePerEU=2,
             )
-            sanitize_decode_logits(out_logits, context_lens, next_n)
+            scrub_decode_logits(out_logits, context_lens, next_n)
             return out_logits
         deepgemm_fp8_paged_mqa_logits_stage1 = (
             aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
