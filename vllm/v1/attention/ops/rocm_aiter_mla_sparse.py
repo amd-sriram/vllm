@@ -457,6 +457,29 @@ def fp8_paged_mqa_logits_torch(
 
 
 @functools.lru_cache
+def _flydsl_paged_mqa_logits_kernel():
+    """aiter's FlyDSL paged (decode) MQA-logits kernel, or None if it is
+    unavailable here.
+
+    ROCm/aiter#4221 adds a gfx950 FlyDSL implementation of the decode kernel.
+    It takes the same tensors in the same order as the Triton/Gluon
+    `deepgemm_fp8_paged_mqa_logits`, but its remaining knobs are keyword-only
+    and its own defaults are tuned for it, so it gets a call site rather than
+    the module swap used on the prefill side.
+
+    The kernel is written against gfx950, so this returns None on every other
+    architecture and the Triton/Gluon kernel is used regardless of the flag.
+    """
+    if not _ON_GFX950:
+        return None
+    try:
+        from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
+    except ImportError:
+        return None
+    return flydsl_fp8_paged_mqa_logits
+
+
+@functools.lru_cache
 def paged_mqa_logits_module():
     paged_mqa_logits_module_path = None
     if find_spec("aiter.ops.triton.pa_mqa_logits") is not None:
@@ -586,6 +609,38 @@ def rocm_fp8_paged_mqa_logits(
 
     if aiter_paged_mqa_logits_module is not None:
         if _ON_GFX942 or _ON_GFX950:
+            if envs.VLLM_ROCM_USE_AITER_FLYDSL_PAGED_MQA_LOGITS:
+                flydsl_fp8_paged_mqa_logits = _flydsl_paged_mqa_logits_kernel()
+                if flydsl_fp8_paged_mqa_logits is not None:
+                    (out_logits,) = current_workspace_manager().get_simultaneous(
+                        ((batch_size * next_n, max_model_len), torch.float32),
+                    )
+                    # The block size is asserted against the cache's own layout
+                    # inside the kernel, so it has to be passed through; the
+                    # remaining knobs keep the kernel's tuned defaults.
+                    flydsl_fp8_paged_mqa_logits(
+                        q_fp8,
+                        kv_cache_fp8,
+                        weights,
+                        out_logits,
+                        context_lens,
+                        block_tables,
+                        max_model_len,
+                        Preshuffle=block_size > 1,
+                        KVBlockSize=block_size,
+                    )
+                    # No -inf prefill: this kernel writes every column up to
+                    # its causal bound `context_lens[b] - next_n + n` and
+                    # nothing past it, so the tail the fill would cover is
+                    # never written and never read.
+                    #
+                    # The sanitize is the same call the Gluon path below
+                    # makes. Its window is that same causal bound, so it
+                    # covers exactly the columns this kernel wrote -- no more
+                    # work than the Gluon path does, and both paths leave the
+                    # workspace in the same state for the top-k.
+                    sanitize_decode_logits(out_logits, context_lens, next_n)
+                    return out_logits
             deepgemm_fp8_paged_mqa_logits = (
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
             )
