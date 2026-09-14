@@ -686,6 +686,15 @@ def rocm_fp8_paged_mqa_logits(
                     (out_logits,) = current_workspace_manager().get_simultaneous(
                         ((batch_size * next_n, max_model_len), torch.float32),
                     )
+                    # The kernel takes one context length per sequence and
+                    # derives each Q row's causal bound itself, so it needs the
+                    # last column of the (B, next_n) per-row bounds, not all of
+                    # them.
+                    flydsl_context_lens = (
+                        context_lens[:, -1].contiguous()
+                        if context_lens.dim() == 2
+                        else context_lens
+                    )
                     # The block size is asserted against the cache's own layout
                     # inside the kernel, so it has to be passed through; the
                     # remaining knobs keep the kernel's tuned defaults.
@@ -694,7 +703,7 @@ def rocm_fp8_paged_mqa_logits(
                         kv_cache_fp8,
                         weights,
                         out_logits,
-                        context_lens,
+                        flydsl_context_lens,
                         block_tables,
                         max_model_len,
                         Preshuffle=block_size > 1,
