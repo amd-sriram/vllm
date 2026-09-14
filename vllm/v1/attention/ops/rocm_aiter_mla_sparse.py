@@ -973,13 +973,16 @@ def rocm_aiter_sparse_attn_indexer(
     elif not skip_k_cache_insert:
         raise ValueError("k must be provided when skip_k_cache_insert is False")
 
+    from aiter import cp_gather_indexer_k_quant_cache, indexer_k_quant_and_cache
+
     if not skip_k_cache_insert:
-        indexer_k_quant_and_cache_triton(
+        indexer_k_quant_and_cache(
             k,
             kv_cache,
             slot_mapping,
             quant_block_size,
             scale_fmt,
+            preshuffle=kv_cache.shape[1] > 1,
         )
 
     if has_prefill:
@@ -994,13 +997,13 @@ def rocm_aiter_sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             k_fp8 = k_fp8_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
-            cp_gather_indexer_k_quant_cache_triton(
+            cp_gather_indexer_k_quant_cache(
                 kv_cache,
                 k_fp8,
                 k_scale,
                 chunk.block_table,
                 chunk.cu_seq_lens,
-                token_to_seq=chunk.token_to_seq,
+                preshuffle=kv_cache.shape[1] > 1,
             )
             logits = rocm_fp8_mqa_logits(
                 q_fp8[chunk.token_start : chunk.token_end],
