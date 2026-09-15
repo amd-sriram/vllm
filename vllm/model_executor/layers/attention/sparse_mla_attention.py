@@ -638,6 +638,11 @@ class SharedTopkIndicesBuffer:
         self._indexer = None
         self._topk_indices_buffer = buffer
 
+    def record_logical_topk_ready(self) -> None:
+        # Impls without an index group convert top-k inline on the main stream,
+        # so there is no side stream waiting on a readiness event.
+        pass
+
 
 class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic[T]):
     """Sparse MLA base with dense and masked-MHA prefill paths."""
