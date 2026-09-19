@@ -713,13 +713,6 @@ def rocm_fp8_paged_mqa_logits(
                     # its causal bound `context_lens[b] - next_n + n` and
                     # nothing past it, so the tail the fill would cover is
                     # never written and never read.
-                    #
-                    # The sanitize is the same call the Gluon path below
-                    # makes. Its window is that same causal bound, so it
-                    # covers exactly the columns this kernel wrote -- no more
-                    # work than the Gluon path does, and both paths leave the
-                    # workspace in the same state for the top-k.
-                    sanitize_decode_logits(out_logits, context_lens, next_n)
                     return out_logits
             deepgemm_fp8_paged_mqa_logits = (
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
