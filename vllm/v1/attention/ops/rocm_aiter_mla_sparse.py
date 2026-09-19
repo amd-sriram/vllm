@@ -696,8 +696,33 @@ def rocm_fp8_paged_mqa_logits(
                         else context_lens
                     )
                     # The block size is asserted against the cache's own layout
-                    # inside the kernel, so it has to be passed through; the
-                    # remaining knobs keep the kernel's tuned defaults.
+                    # inside the kernel, so it has to be passed through.
+                    #
+                    # SplitKV has to be passed explicitly. Left to its default
+                    # the kernel derives it from `context_lens.max().item()`,
+                    # and that device-to-host read is illegal inside a CUDA
+                    # graph capture: warm-up dies with
+                    # `hipErrorStreamCaptureUnsupported`. The kernel documents
+                    # the way out -- an explicit SplitKV is capture-safe.
+                    #
+                    # This mirrors the kernel's own formula with the one term
+                    # it cannot know on the host replaced by a bound: the
+                    # longest context is at most `max_model_len`, which is
+                    # already a host-side int. Both terms are constants for a
+                    # given batch size, so the value is stable across a
+                    # capture and its replays.
+                    kv_block = block_size if block_size > 0 else 64
+                    pages_upper_bound = (max_model_len + kv_block - 1) // kv_block
+                    total_cu = torch.cuda.get_device_properties(
+                        q_fp8.device.index
+                    ).multi_processor_count
+                    split_kv = max(
+                        1,
+                        min(
+                            pages_upper_bound,
+                            (total_cu * 3 + batch_size - 1) // batch_size,
+                        ),
+                    )
                     flydsl_fp8_paged_mqa_logits(
                         q_fp8,
                         kv_cache_fp8,
@@ -708,6 +733,7 @@ def rocm_fp8_paged_mqa_logits(
                         max_model_len,
                         Preshuffle=block_size > 1,
                         KVBlockSize=block_size,
+                        SplitKV=split_kv,
                     )
                     # No -inf prefill: this kernel writes every column up to
                     # its causal bound `context_lens[b] - next_n + n` and
