@@ -769,6 +769,29 @@ def rocm_fp8_paged_mqa_logits_triton(
 
 
 @functools.lru_cache
+def _flydsl_paged_mqa_logits_kernel():
+    """aiter's FlyDSL paged (decode) MQA-logits kernel, or None if it is
+    unavailable here.
+
+    ROCm/aiter#4221 adds a gfx950 FlyDSL implementation of the decode kernel.
+    It takes the same tensors in the same order as the Triton/Gluon
+    `deepgemm_fp8_paged_mqa_logits`, but its remaining knobs are keyword-only
+    and its own defaults are tuned for it, so it gets a call site rather than
+    the module swap used on the prefill side.
+
+    The kernel is written against gfx950, so this returns None on every other
+    architecture and the Triton/Gluon kernel is used regardless of the flag.
+    """
+    if not _ON_GFX950:
+        return None
+    try:
+        from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
+    except ImportError:
+        return None
+    return flydsl_fp8_paged_mqa_logits
+
+
+@functools.lru_cache
 def paged_mqa_logits_module():
     paged_mqa_logits_module_path = None
     if find_spec("aiter.ops.triton.pa_mqa_logits") is not None:
@@ -845,6 +868,66 @@ def rocm_fp8_paged_mqa_logits(
 
     if aiter_paged_mqa_logits_module is not None:
         if _ON_GFX942 or _ON_GFX950:
+            if envs.VLLM_ROCM_USE_AITER_FLYDSL_PAGED_MQA_LOGITS:
+                flydsl_fp8_paged_mqa_logits = _flydsl_paged_mqa_logits_kernel()
+                if flydsl_fp8_paged_mqa_logits is not None:
+                    (out_logits,) = current_workspace_manager().get_simultaneous(
+                        ((batch_size * next_n, max_model_len), torch.float32),
+                    )
+                    # The kernel takes one context length per sequence and
+                    # derives each Q row's causal bound itself, so it needs the
+                    # last column of the (B, next_n) per-row bounds, not all of
+                    # them.
+                    flydsl_context_lens = (
+                        context_lens[:, -1].contiguous()
+                        if context_lens.dim() == 2
+                        else context_lens
+                    )
+                    # The block size is asserted against the cache's own layout
+                    # inside the kernel, so it has to be passed through.
+                    #
+                    # SplitKV has to be passed explicitly. Left to its default
+                    # the kernel derives it from `context_lens.max().item()`,
+                    # and that device-to-host read is illegal inside a CUDA
+                    # graph capture: warm-up dies with
+                    # `hipErrorStreamCaptureUnsupported`. The kernel documents
+                    # the way out -- an explicit SplitKV is capture-safe.
+                    #
+                    # This mirrors the kernel's own formula with the one term
+                    # it cannot know on the host replaced by a bound: the
+                    # longest context is at most `max_model_len`, which is
+                    # already a host-side int. Both terms are constants for a
+                    # given batch size, so the value is stable across a
+                    # capture and its replays.
+                    kv_block = block_size if block_size > 0 else 64
+                    pages_upper_bound = (max_model_len + kv_block - 1) // kv_block
+                    total_cu = torch.cuda.get_device_properties(
+                        q_fp8.device.index
+                    ).multi_processor_count
+                    split_kv = max(
+                        1,
+                        min(
+                            pages_upper_bound,
+                            (total_cu * 3 + batch_size - 1) // batch_size,
+                        ),
+                    )
+                    flydsl_fp8_paged_mqa_logits(
+                        q_fp8,
+                        kv_cache_fp8,
+                        weights,
+                        out_logits,
+                        flydsl_context_lens,
+                        block_tables,
+                        max_model_len,
+                        Preshuffle=block_size > 1,
+                        KVBlockSize=block_size,
+                        SplitKV=split_kv,
+                    )
+                    # No -inf prefill: this kernel writes every column up to
+                    # its causal bound `context_lens[b] - next_n + n` and
+                    # nothing past it, so the tail the fill would cover is
+                    # never written and never read.
+                    return out_logits
             deepgemm_fp8_paged_mqa_logits = (
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
             )
