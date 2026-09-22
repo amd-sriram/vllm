@@ -1278,14 +1278,34 @@ def rocm_aiter_sparse_attn_indexer(
     elif not skip_k_cache_insert:
         raise ValueError("k must be provided when skip_k_cache_insert is False")
 
+    # AITER's indexer cache ops take the layout as `preshuffle`, which matches the
+    # Triton default (SHUFFLE when block_size > 1) but cannot express the C4A
+    # block-flat override, so that case stays on Triton.
+    use_aiter_indexer_cache = _ON_GFX950 and not _indexer_k_is_c4a_block_flat(
+        compress_ratio
+    )
+    preshuffle = kv_cache.shape[1] > 1
+
     if not skip_k_cache_insert:
-        indexer_k_quant_and_cache_triton(
-            k,
-            kv_cache,
-            slot_mapping,
-            quant_block_size,
-            scale_fmt,
-        )
+        if use_aiter_indexer_cache:
+            from aiter import indexer_k_quant_and_cache
+
+            indexer_k_quant_and_cache(
+                k,
+                kv_cache,
+                slot_mapping,
+                quant_block_size,
+                scale_fmt,
+                preshuffle=preshuffle,
+            )
+        else:
+            indexer_k_quant_and_cache_triton(
+                k,
+                kv_cache,
+                slot_mapping,
+                quant_block_size,
+                scale_fmt,
+            )
 
     if has_prefill:
         prefill_metadata = layer_attn_metadata.prefill
@@ -1299,17 +1319,31 @@ def rocm_aiter_sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             k_fp8 = k_fp8_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
-            cp_gather_indexer_k_quant_cache_triton(
-                kv_cache,
-                k_fp8,
-                k_scale,
-                chunk.block_table,
-                chunk.cu_seq_lens,
-                token_to_seq=chunk.token_to_seq,
-                cache_layout=(
-                    "NORMAL" if _indexer_k_is_c4a_block_flat(compress_ratio) else None
-                ),
-            )
+            if use_aiter_indexer_cache:
+                from aiter import cp_gather_indexer_k_quant_cache
+
+                cp_gather_indexer_k_quant_cache(
+                    kv_cache,
+                    k_fp8,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                    preshuffle=preshuffle,
+                )
+            else:
+                cp_gather_indexer_k_quant_cache_triton(
+                    kv_cache,
+                    k_fp8,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                    token_to_seq=chunk.token_to_seq,
+                    cache_layout=(
+                        "NORMAL"
+                        if _indexer_k_is_c4a_block_flat(compress_ratio)
+                        else None
+                    ),
+                )
             logits = rocm_fp8_mqa_logits(
                 q_fp8[chunk.token_start : chunk.token_end],
                 (k_fp8, k_scale.view(torch.float32)),
