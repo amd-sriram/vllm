@@ -582,10 +582,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
         self.is_amx_bmm_enabled = getattr(self.impl, "uses_amx_bmm", False)
-        # AMX reads kv_b_proj's weight directly and never calls it live; the
-        # reference CPU MLA backend calls it but isn't perf-critical. Skip
-        # the packed-kernel dispatch either way.
-        kv_b_proj._cpu_skip_gemm_dispatch = True
+        # MLA reads this weight directly to build W_UK/W_UV, so a backend must
+        # not relayout it at load time.
+        kv_b_proj.skip_weight_relayout = True
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         vllm_config = get_current_vllm_config()
@@ -1553,7 +1552,10 @@ class _DecodeConcatQuantFP8(QuantFP8):
             scale: torch.Tensor,
             scale_ub: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            decode_q0 = torch.cat((decode_ql_nope, decode_q_pe), dim=-1)
+            if decode_q_pe.shape[-1] == 0 and decode_ql_nope.is_contiguous():
+                decode_q0 = decode_ql_nope
+            else:
+                decode_q0 = torch.cat((decode_ql_nope, decode_q_pe), dim=-1)
             decode_q_flat = decode_q0.reshape(decode_q0.shape[0], -1)
             decode_q, _ = quant_fn(self, decode_q_flat, scale, scale_ub)
             return decode_q.view(decode_q0.shape)
