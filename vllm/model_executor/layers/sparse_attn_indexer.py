@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+from typing import Any
+
 import torch
 import torch.distributed as dist
 
@@ -899,6 +901,9 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self._cp_kv_cache_interleave_size: int | None = None
+        # Fusion inputs stay off the forward_hip signature so overrides on
+        # main (RocmSparseAttnIndexer) remain compatible.
+        self._qk_fusion_call: dict[str, Any] | None = None
         if current_platform.is_cuda() and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
@@ -947,6 +952,7 @@ class SparseAttnIndexer(CustomOp):
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         k: torch.Tensor | None,
         weights: torch.Tensor,
+        **fusion_kwargs,
     ):
         if current_platform.is_cuda() or current_platform.is_xpu():
             return self.forward_cuda(hidden_states, q_quant, k, weights)
@@ -955,7 +961,13 @@ class SparseAttnIndexer(CustomOp):
                 raise NotImplementedError(
                     "The ROCm sparse-indexer path does not support PCP+DCP."
                 )
-            return self.forward_hip(hidden_states, q_quant, k, weights)
+            # Keep forward_hip's signature stable for overrides such as
+            # RocmSparseAttnIndexer. Fusion inputs travel on the instance.
+            self._qk_fusion_call = fusion_kwargs
+            try:
+                return self.forward_hip(hidden_states, q_quant, k, weights)
+            finally:
+                self._qk_fusion_call = None
         elif current_platform.is_cpu():
             return self.forward_cpu(hidden_states, q_quant, k, weights)
         else:
@@ -970,6 +982,7 @@ class SparseAttnIndexer(CustomOp):
         q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         k: torch.Tensor | None,
         weights: torch.Tensor,
+        **fusion_kwargs,
     ):
         # FP8 path: single tensor (per-token scale is folded into `weights`).
         # FP4 path: (values, scales) tuple with scales required by the kernel.
@@ -1012,6 +1025,7 @@ class SparseAttnIndexer(CustomOp):
         q_fp8: torch.Tensor,
         k: torch.Tensor | None,
         weights: torch.Tensor,
+        **fusion_kwargs,
     ):
         return self.forward_cuda(hidden_states, q_fp8, k, weights)
 
@@ -1022,6 +1036,17 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor | None,
         weights: torch.Tensor,
     ):
+        fusion = self._qk_fusion_call or {}
+        self._qk_fusion_call = None
+        k_norm_weight = fusion.get("k_norm_weight")
+        k_norm_bias = fusion.get("k_norm_bias")
+        k_norm_eps = fusion.get("k_norm_eps", 1e-6)
+        positions = fusion.get("positions")
+        cos_cache = fusion.get("cos_cache")
+        sin_cache = fusion.get("sin_cache")
+        weights_scale = fusion.get("weights_scale", 1.0)
+        is_neox_style = fusion.get("is_neox_style", True)
+        use_qk_rope_cache_fusion = fusion.get("use_qk_rope_cache_fusion", False)
         assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
@@ -1056,6 +1081,15 @@ class SparseAttnIndexer(CustomOp):
                 candidate_blocks=self.candidate_blocks,
                 candidate_block_size=self.candidate_block_size,
                 candidate_write=self.candidate_write,
+                k_norm_weight=k_norm_weight,
+                k_norm_bias=k_norm_bias,
+                k_norm_eps=k_norm_eps,
+                positions=positions,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
+                weights_scale=weights_scale,
+                is_neox_style=is_neox_style,
+                use_qk_rope_cache_fusion=use_qk_rope_cache_fusion,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path requires AITER or a supported "
