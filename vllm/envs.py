@@ -145,6 +145,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
+    VLLM_ROCM_INDEXER_NATIVE_DECODE_MAX_NEXT_N: int = 2
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
@@ -152,11 +153,13 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
+    VLLM_ROCM_USE_AITER_FLYDSL_MQA_LOGITS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
+    VLLM_ROCM_USE_AITER_FLYDSL_PAGED_MQA_LOGITS: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1327,6 +1330,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ["auto", "gluon", "asm"],
         case_sensitive=False,
     ),
+    # Largest DSA-indexer decode `next_n` (1 + num_speculative_tokens) that is
+    # passed to the paged MQA-logits kernel as `next_n` Q rows per request.
+    # Above this the decode is flattened to one row per query, which re-reads
+    # the KV tile once per row. The aiter paged kernels read `next_n` off
+    # `q.shape[1]` and have no upper bound of their own; the default of 2 keeps
+    # the previously validated behaviour.
+    "VLLM_ROCM_INDEXER_NATIVE_DECODE_MAX_NEXT_N": lambda: int(
+        os.getenv("VLLM_ROCM_INDEXER_NATIVE_DECODE_MAX_NEXT_N", "2")
+    ),
     # Whether to use aiter mha ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA": lambda: (
@@ -1363,6 +1375,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "False").lower()
         in ("true", "1")
     ),
+    # Whether to use the aiter FlyDSL prefill MQA-logits kernel for the
+    # sparse-attention indexer instead of the Triton/Gluon one (gfx950).
+    # By default is disabled.
+    "VLLM_ROCM_USE_AITER_FLYDSL_MQA_LOGITS": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_FLYDSL_MQA_LOGITS", "False").lower()
+        in ("true", "1")
+    ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
@@ -1379,6 +1398,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
+    ),
+    # Whether to use the aiter FlyDSL paged (decode) MQA-logits kernel for the
+    # sparse-attention indexer instead of the Triton/Gluon one (gfx950).
+    # By default is disabled.
+    "VLLM_ROCM_USE_AITER_FLYDSL_PAGED_MQA_LOGITS": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_FLYDSL_PAGED_MQA_LOGITS", "False").lower()
+        in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE

@@ -5,6 +5,7 @@ import importlib
 import math
 from collections.abc import Callable
 from importlib.util import find_spec
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -769,6 +770,29 @@ def rocm_fp8_paged_mqa_logits_triton(
 
 
 @functools.lru_cache
+def _flydsl_paged_mqa_logits_kernel():
+    """aiter's FlyDSL paged (decode) MQA-logits kernel, or None if it is
+    unavailable here.
+
+    ROCm/aiter#4221 adds a gfx950 FlyDSL implementation of the decode kernel.
+    It takes the same tensors in the same order as the Triton/Gluon
+    `deepgemm_fp8_paged_mqa_logits`, but its remaining knobs are keyword-only
+    and its own defaults are tuned for it, so it gets a call site rather than
+    the module swap used on the prefill side.
+
+    The kernel is written against gfx950, so this returns None on every other
+    architecture and the Triton/Gluon kernel is used regardless of the flag.
+    """
+    if not _ON_GFX950:
+        return None
+    try:
+        from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
+    except ImportError:
+        return None
+    return flydsl_fp8_paged_mqa_logits
+
+
+@functools.lru_cache
 def paged_mqa_logits_module():
     paged_mqa_logits_module_path = None
     if find_spec("aiter.ops.triton.pa_mqa_logits") is not None:
@@ -845,6 +869,66 @@ def rocm_fp8_paged_mqa_logits(
 
     if aiter_paged_mqa_logits_module is not None:
         if _ON_GFX942 or _ON_GFX950:
+            if envs.VLLM_ROCM_USE_AITER_FLYDSL_PAGED_MQA_LOGITS:
+                flydsl_fp8_paged_mqa_logits = _flydsl_paged_mqa_logits_kernel()
+                if flydsl_fp8_paged_mqa_logits is not None:
+                    (out_logits,) = current_workspace_manager().get_simultaneous(
+                        ((batch_size * next_n, max_model_len), torch.float32),
+                    )
+                    # The kernel takes one context length per sequence and
+                    # derives each Q row's causal bound itself, so it needs the
+                    # last column of the (B, next_n) per-row bounds, not all of
+                    # them.
+                    flydsl_context_lens = (
+                        context_lens[:, -1].contiguous()
+                        if context_lens.dim() == 2
+                        else context_lens
+                    )
+                    # The block size is asserted against the cache's own layout
+                    # inside the kernel, so it has to be passed through.
+                    #
+                    # SplitKV has to be passed explicitly. Left to its default
+                    # the kernel derives it from `context_lens.max().item()`,
+                    # and that device-to-host read is illegal inside a CUDA
+                    # graph capture: warm-up dies with
+                    # `hipErrorStreamCaptureUnsupported`. The kernel documents
+                    # the way out -- an explicit SplitKV is capture-safe.
+                    #
+                    # This mirrors the kernel's own formula with the one term
+                    # it cannot know on the host replaced by a bound: the
+                    # longest context is at most `max_model_len`, which is
+                    # already a host-side int. Both terms are constants for a
+                    # given batch size, so the value is stable across a
+                    # capture and its replays.
+                    kv_block = block_size if block_size > 0 else 64
+                    pages_upper_bound = (max_model_len + kv_block - 1) // kv_block
+                    total_cu = torch.cuda.get_device_properties(
+                        q_fp8.device.index
+                    ).multi_processor_count
+                    split_kv = max(
+                        1,
+                        min(
+                            pages_upper_bound,
+                            (total_cu * 3 + batch_size - 1) // batch_size,
+                        ),
+                    )
+                    flydsl_fp8_paged_mqa_logits(
+                        q_fp8,
+                        kv_cache_fp8,
+                        weights,
+                        out_logits,
+                        flydsl_context_lens,
+                        block_tables,
+                        max_model_len,
+                        Preshuffle=block_size > 1,
+                        KVBlockSize=block_size,
+                        SplitKV=split_kv,
+                    )
+                    # No -inf prefill: this kernel writes every column up to
+                    # its causal bound `context_lens[b] - next_n + n` and
+                    # nothing past it, so the tail the fill would cover is
+                    # never written and never read.
+                    return out_logits
             deepgemm_fp8_paged_mqa_logits = (
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
             )
@@ -944,8 +1028,32 @@ def fp8_mqa_logits_torch(
     return logits
 
 
+def _flydsl_mqa_logits_module():
+    """aiter's FlyDSL prefill MQA-logits kernel, wrapped to look like the
+    Triton/Gluon module, or None if it is unavailable here.
+
+    ROCm/aiter#4538 adds a gfx950 FlyDSL implementation whose launcher takes
+    the same arguments as `fp8_mqa_logits`, so exposing it under that name is
+    enough to swap the two. It stays opt-in while the PR is unmerged, and is
+    gfx950-only: the kernel is written against that ISA, so any other
+    architecture keeps the Triton/Gluon module.
+    """
+    if not _ON_GFX950:
+        return None
+    try:
+        from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+    except ImportError:
+        return None
+    return SimpleNamespace(fp8_mqa_logits=flydsl_fp8_mqa_logits)
+
+
 @functools.lru_cache
 def mqa_logits_module():
+    if envs.VLLM_ROCM_USE_AITER_FLYDSL_MQA_LOGITS:
+        flydsl_module = _flydsl_mqa_logits_module()
+        if flydsl_module is not None:
+            return flydsl_module
+
     mqa_logits_module_path = None
     if find_spec("aiter.ops.triton.fp8_mqa_logits") is not None:
         mqa_logits_module_path = "aiter.ops.triton.fp8_mqa_logits"
@@ -1003,7 +1111,9 @@ def rocm_fp8_mqa_logits(
 
     if aiter_mqa_logits_module is not None:
         fp8_mqa_logits = aiter_mqa_logits_module.fp8_mqa_logits
-        return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
+        return fp8_mqa_logits(
+            q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=False
+        )
     else:
         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
@@ -1278,14 +1388,34 @@ def rocm_aiter_sparse_attn_indexer(
     elif not skip_k_cache_insert:
         raise ValueError("k must be provided when skip_k_cache_insert is False")
 
+    # AITER's indexer cache ops take the layout as `preshuffle`, which matches the
+    # Triton default (SHUFFLE when block_size > 1) but cannot express the C4A
+    # block-flat override, so that case stays on Triton.
+    use_aiter_indexer_cache = _ON_GFX950 and not _indexer_k_is_c4a_block_flat(
+        compress_ratio
+    )
+    preshuffle = kv_cache.shape[1] > 1
+
     if not skip_k_cache_insert:
-        indexer_k_quant_and_cache_triton(
-            k,
-            kv_cache,
-            slot_mapping,
-            quant_block_size,
-            scale_fmt,
-        )
+        if use_aiter_indexer_cache:
+            from aiter import indexer_k_quant_and_cache
+
+            indexer_k_quant_and_cache(
+                k,
+                kv_cache,
+                slot_mapping,
+                quant_block_size,
+                scale_fmt,
+                preshuffle=preshuffle,
+            )
+        else:
+            indexer_k_quant_and_cache_triton(
+                k,
+                kv_cache,
+                slot_mapping,
+                quant_block_size,
+                scale_fmt,
+            )
 
     if has_prefill:
         prefill_metadata = layer_attn_metadata.prefill
@@ -1299,17 +1429,31 @@ def rocm_aiter_sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             k_fp8 = k_fp8_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
-            cp_gather_indexer_k_quant_cache_triton(
-                kv_cache,
-                k_fp8,
-                k_scale,
-                chunk.block_table,
-                chunk.cu_seq_lens,
-                token_to_seq=chunk.token_to_seq,
-                cache_layout=(
-                    "NORMAL" if _indexer_k_is_c4a_block_flat(compress_ratio) else None
-                ),
-            )
+            if use_aiter_indexer_cache:
+                from aiter import cp_gather_indexer_k_quant_cache
+
+                cp_gather_indexer_k_quant_cache(
+                    kv_cache,
+                    k_fp8,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                    preshuffle=preshuffle,
+                )
+            else:
+                cp_gather_indexer_k_quant_cache_triton(
+                    kv_cache,
+                    k_fp8,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.cu_seq_lens,
+                    token_to_seq=chunk.token_to_seq,
+                    cache_layout=(
+                        "NORMAL"
+                        if _indexer_k_is_c4a_block_flat(compress_ratio)
+                        else None
+                    ),
+                )
             logits = rocm_fp8_mqa_logits(
                 q_fp8[chunk.token_start : chunk.token_end],
                 (k_fp8, k_scale.view(torch.float32)),
