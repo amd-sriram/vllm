@@ -621,6 +621,96 @@ def _flydsl_paged_mqa_logits_kernel():
     return flydsl_fp8_paged_mqa_logits
 
 
+# The split merge accepts at most 64 splits; the auto plan can pick 128.
+_FLYDSL_PAGED_MQA_TOPK_MAX_SPLITS = 64
+_flydsl_paged_mqa_topk_workspaces: dict[torch.device, tuple[torch.Tensor, ...]] = {}
+
+
+@functools.lru_cache
+def _flydsl_paged_mqa_topk_ops():
+    """aiter's fused FlyDSL paged (decode) MQA-logits + top-k, or None if it is
+    unavailable here.
+
+    ROCm/aiter#5525 scores the paged cache, keeps an exact top-k per history
+    split and merges the splits, so the [rows, max_model_len] logits are never
+    written. gfx950 only, next_n == 1, cache block size 64.
+    """
+    if not _ON_GFX950:
+        return None
+    try:
+        from aiter.ops.flydsl import flydsl_fp8_paged_mqa_topk
+        from aiter.ops.flydsl.fp8_paged_mqa_local_topk import (
+            SUPPORTED_K,
+            _auto_num_splits,
+        )
+        from aiter.ops.flydsl.split_topk_merge import alloc_split_topk_merge_workspace
+    except ImportError:
+        return None
+    return (
+        flydsl_fp8_paged_mqa_topk,
+        _auto_num_splits,
+        alloc_split_topk_merge_workspace,
+        SUPPORTED_K,
+    )
+
+
+def _reserve_flydsl_paged_mqa_topk_workspace(device: torch.device, rows: int) -> None:
+    # Must run outside CUDA-graph capture: the merge keeps the histogram zeroed
+    # between calls, so it is allocated once and reused by every layer.
+    ops = _flydsl_paged_mqa_topk_ops()
+    if ops is not None and device not in _flydsl_paged_mqa_topk_workspaces:
+        _flydsl_paged_mqa_topk_workspaces[device] = ops[2](device, rows)
+
+
+def _rocm_flydsl_paged_mqa_topk(
+    q_fp8: torch.Tensor,
+    kv_cache_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+) -> bool:
+    """Write the decode top-k positions into `topk_indices` with the fused
+    kernel. Returns False, writing nothing, when it cannot run this call."""
+    ops = _flydsl_paged_mqa_topk_ops()
+    workspace = _flydsl_paged_mqa_topk_workspaces.get(q_fp8.device)
+    rows = q_fp8.shape[0]
+    block_size = kv_cache_fp8.shape[1]
+    if (
+        ops is None
+        or workspace is None
+        or rows > workspace[0].shape[0]
+        or block_size != 64
+        or topk_tokens not in ops[3]
+        or not topk_indices.is_contiguous()
+    ):
+        return False
+    topk_fn, auto_num_splits, _, _ = ops
+    num_splits = min(
+        _FLYDSL_PAGED_MQA_TOPK_MAX_SPLITS,
+        auto_num_splits(
+            rows, q_fp8.device, block_tables.shape[1] * block_size, topk_tokens
+        ),
+    )
+    logger.info_once("Using AITER FlyDSL fused paged MQA logits + top-k kernel")
+    topk_fn(
+        q_fp8,
+        kv_cache_fp8,
+        None,
+        weights,
+        context_lens.reshape(-1).contiguous(),
+        block_tables.contiguous(),
+        k=topk_tokens,
+        num_splits=num_splits,
+        workspace=(workspace[0][:rows], workspace[1][:rows])
+        if num_splits > 1
+        else None,
+        out_positions=topk_indices,
+    )
+    return True
+
+
 @functools.lru_cache
 def paged_mqa_logits_module():
     paged_mqa_logits_module_path = None
@@ -997,6 +1087,8 @@ def rocm_aiter_sparse_attn_indexer(
 
         # Decode logits buffer, used by rocm_fp8_paged_mqa_logits.
         decode_rows = _max_decode_logits_rows(hidden_states.shape[0])
+        if envs.VLLM_ROCM_USE_AITER_FLYDSL_PAGED_MQA_TOPK:
+            _reserve_flydsl_paged_mqa_topk_workspace(hidden_states.device, decode_rows)
         if _ON_GFX942 or _ON_GFX950:
             workspace_manager.get_simultaneous(
                 ((decode_rows, max_model_len), torch.float32),
@@ -1172,6 +1264,24 @@ def rocm_aiter_sparse_attn_indexer(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
+
+        if (
+            envs.VLLM_ROCM_USE_AITER_FLYDSL_PAGED_MQA_TOPK
+            and next_n == 1
+            and compress_ratio == 1
+            and candidate_blocks is None
+            and not decode_metadata.requires_padding
+            and _rocm_flydsl_paged_mqa_topk(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                decode_metadata.seq_lens,
+                decode_metadata.block_table,
+                topk_indices_buffer[:num_padded_tokens, :topk_tokens],
+                topk_tokens,
+            )
+        ):
+            return topk_indices_buffer
 
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
