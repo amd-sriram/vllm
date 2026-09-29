@@ -622,6 +622,26 @@ def _flydsl_paged_mqa_logits_kernel():
 
 
 @functools.lru_cache
+def _hip_paged_mqa_logits_kernel(num_heads: int, head_dim: int, block_size: int):
+    """aiter's HIP paged (decode) MQA-logits kernel, or None if it cannot run
+    this shape here.
+
+    ROCm/aiter#5047 adds it for gfx950 only, at 32 heads, head_dim 128 and a
+    cache block size of 1 or 64. It takes the same tensors as the Triton/Gluon
+    `deepgemm_fp8_paged_mqa_logits`.
+    """
+    if not _ON_GFX950:
+        return None
+    try:
+        from aiter.ops.fp8_paged_mqa_logits import fp8_paged_mqa_logits, is_supported
+    except ImportError:
+        return None
+    if not is_supported(num_heads, head_dim, block_size):
+        return None
+    return fp8_paged_mqa_logits
+
+
+@functools.lru_cache
 def paged_mqa_logits_module():
     paged_mqa_logits_module_path = None
     if find_spec("aiter.ops.triton.pa_mqa_logits") is not None:
@@ -680,6 +700,30 @@ def rocm_fp8_paged_mqa_logits(
 
     if aiter_paged_mqa_logits_module is not None:
         if _ON_GFX942 or _ON_GFX950:
+            if envs.VLLM_ROCM_USE_AITER_HIP_PAGED_MQA_LOGITS:
+                hip_fp8_paged_mqa_logits = _hip_paged_mqa_logits_kernel(
+                    q_fp8.shape[2], q_fp8.shape[3], block_size
+                )
+                if hip_fp8_paged_mqa_logits is not None:
+                    logger.info_once("Using AITER HIP paged MQA logits kernel")
+                    (out_logits,) = current_workspace_manager().get_simultaneous(
+                        ((batch_size * next_n, max_model_len), torch.float32),
+                    )
+                    # The kernel reads raw pointers: one context length per
+                    # sequence, and block tables with row stride == size(1).
+                    hip_context_lens = (
+                        context_lens[:, -1] if context_lens.dim() == 2 else context_lens
+                    )
+                    hip_fp8_paged_mqa_logits(
+                        q_fp8,
+                        kv_cache_fp8,
+                        weights,
+                        hip_context_lens.contiguous(),
+                        block_tables.contiguous(),
+                        max_model_len,
+                        out=out_logits,
+                    )
+                    return out_logits
             if envs.VLLM_ROCM_USE_AITER_FLYDSL_PAGED_MQA_LOGITS:
                 flydsl_fp8_paged_mqa_logits = _flydsl_paged_mqa_logits_kernel()
                 if flydsl_fp8_paged_mqa_logits is not None:
