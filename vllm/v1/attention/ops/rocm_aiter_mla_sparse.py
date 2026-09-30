@@ -1278,36 +1278,23 @@ def rocm_aiter_sparse_attn_indexer(
     elif not skip_k_cache_insert:
         raise ValueError("k must be provided when skip_k_cache_insert is False")
 
-    # AITER's indexer cache ops take the layout as `preshuffle`, which matches the
-    # Triton default (SHUFFLE when block_size > 1) but cannot express the C4A
-    # block-flat override, so that case stays on Triton.
-    use_aiter_indexer_cache = _ON_GFX950 and not _indexer_k_is_c4a_block_flat(
-        compress_ratio
-    )
-    preshuffle = kv_cache.shape[1] > 1
-
     if not skip_k_cache_insert:
-        if use_aiter_indexer_cache:
-            from aiter import indexer_k_quant_and_cache
-
-            indexer_k_quant_and_cache(
-                k,
-                kv_cache,
-                slot_mapping,
-                quant_block_size,
-                scale_fmt,
-                preshuffle=preshuffle,
-            )
-        else:
-            indexer_k_quant_and_cache_triton(
-                k,
-                kv_cache,
-                slot_mapping,
-                quant_block_size,
-                scale_fmt,
-            )
+        indexer_k_quant_and_cache_triton(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+        )
 
     if has_prefill:
+        # AITER's gather takes the layout as `preshuffle`, which matches the Triton
+        # default (SHUFFLE when block_size > 1) but cannot express the C4A
+        # block-flat override, so that case stays on Triton.
+        use_aiter_gather = _ON_GFX950 and not _indexer_k_is_c4a_block_flat(
+            compress_ratio
+        )
+        preshuffle = kv_cache.shape[1] > 1
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
 
@@ -1319,7 +1306,7 @@ def rocm_aiter_sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             k_fp8 = k_fp8_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
-            if use_aiter_indexer_cache:
+            if use_aiter_gather:
                 from aiter import cp_gather_indexer_k_quant_cache
 
                 cp_gather_indexer_k_quant_cache(
