@@ -8,8 +8,9 @@ import torch
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import divide
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import (
@@ -338,6 +339,20 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # every _forward call (it reads an env-derived flag each time).
         self._conv_state_dim_first = is_conv_state_dim_first()
 
+        self._fused_decode = None
+        # The fused kernel assumes a conv state of width conv_size - 1 (no MTP).
+        if (
+            envs.VLLM_ROCM_USE_FUSED_KDA_DECODE
+            and current_platform.is_rocm()
+            and self.num_spec == 0
+            and self.kda_lower_bound is not None
+        ):
+            from aiter.ops.triton.gated_delta_net.fused_kda_decode import (
+                fused_kda_decode,
+            )
+
+            self._fused_decode = fused_kda_decode
+
         additional_config = vllm_config.additional_config
         self.kda_prefill_backend = _resolve_kda_prefill_backend(
             additional_config.get("kda_prefill_backend", "auto")
@@ -476,6 +491,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
 
         g_proj_states = self.g_b_proj(g_a)[0]
+        decode_metadata = (
+            self._plain_decode_metadata() if self._fused_decode is not None else None
+        )
+        if decode_metadata is not None:
+            core_attn_out = self._fused_decode_attn(
+                qkv, g1, beta, g_proj_states, decode_metadata
+            )
+            return self.o_proj(core_attn_out)[0]
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
@@ -495,6 +518,73 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
         return self.o_proj(core_attn_out)[0]
+
+    def _plain_decode_metadata(self) -> GDNAttentionMetadata | None:
+        """This layer's metadata when the step is decode-only with no
+        spec-decode tokens, else None."""
+        forward_context = get_forward_context()
+        # A breakable-graph segment would bake this host-side branch into
+        # replays that also carry prefills.
+        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            return None
+        attn_metadata = forward_context.attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return None
+        metadata = attn_metadata.get(self.prefix)
+        if (
+            not isinstance(metadata, GDNAttentionMetadata)
+            or metadata.num_prefills > 0
+            or metadata.num_decodes == 0
+        ):
+            return None
+        return metadata
+
+    def _fused_decode_attn(
+        self,
+        qkv: torch.Tensor,
+        g1: torch.Tensor,
+        beta: torch.Tensor,
+        g_proj_states: torch.Tensor,
+        metadata: GDNAttentionMetadata,
+    ) -> torch.Tensor:
+        """Conv1d update, recurrence and gated RMSNorm in one AITER launch;
+        returns the normed ``[num_tokens, local_projection_size]`` output."""
+        assert self._fused_decode is not None
+        conv_state, recurrent_state = self.kv_cache
+        if not self._conv_state_dim_first:
+            conv_state = conv_state.transpose(-1, -2)
+        return self._fused_decode(
+            qkv,
+            conv_state,
+            self._get_merged_conv_weight(),
+            g1,
+            beta,
+            g_proj_states,
+            self.A_log.view(-1),
+            self.dt_bias,
+            recurrent_state,
+            metadata.non_spec_state_indices_tensor,
+            metadata.non_spec_query_start_loc,
+            self.o_norm.weight,
+            self.o_norm.eps,
+            self.head_dim,
+            self.local_num_heads,
+            self.kda_lower_bound,
+        )
+
+    def _get_merged_conv_weight(self) -> torch.Tensor:
+        """q|k|v conv weights concatenated along the channel dim, built once
+        after the weights are loaded."""
+        if self._merged_conv_weight is None:
+
+            def _w(m):
+                return m.weight.view(m.weight.size(0), m.weight.size(2))
+
+            self._merged_conv_weight = torch.cat(
+                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
+                dim=0,
+            ).contiguous()
+        return self._merged_conv_weight
 
     @eager_break_during_capture
     def _forward(
@@ -553,16 +643,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # three calls. The merged weight is q|k|v conv weights concatenated;
         # built once and cached (params are fixed after load). conv_state is
         # already stored as the merged q|k|v state, so it is used directly.
-        if self._merged_conv_weight is None:
-
-            def _w(m):
-                return m.weight.view(m.weight.size(0), m.weight.size(2))
-
-            self._merged_conv_weight = torch.cat(
-                [_w(self.q_conv1d), _w(self.k_conv1d), _w(self.v_conv1d)],
-                dim=0,
-            ).contiguous()
-        conv_weights = self._merged_conv_weight
+        conv_weights = self._get_merged_conv_weight()
         conv_bias = self.q_conv1d.bias
 
         # Split projections / gating into spec (draft-verify) and non-spec token
