@@ -655,6 +655,9 @@ class DeepSeekV32IndexerDecodeMetadata:
     schedule_metadata: torch.Tensor
     global_seq_lens: torch.Tensor | None = None
     per_req_decode_lens: torch.Tensor | None = None
+    # ROCm, native MTP path only: (B,) last column of seq_lens, the one
+    # length per sequence the AITER paged MQA logits kernels read.
+    per_req_seq_lens: torch.Tensor | None = None
     decode_is_uniform: bool = True
     write_max_decode_len: int = 0
     indices: torch.Tensor | None = None
@@ -976,6 +979,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             device=self.device,
         )
         self.per_req_decode_lens_buffer = torch.zeros(
+            (scheduler_config.max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.per_req_seq_lens_buffer = torch.zeros(
             (scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
             device=self.device,
@@ -1696,6 +1704,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 schedule_metadata = self.scheduler_metadata_buffer[: metadata.shape[0]]
                 schedule_metadata[:] = metadata
 
+            per_req_seq_lens = None
+            if current_platform.is_rocm() and seq_lens.shape[1] > 1:
+                per_req_seq_lens = self.per_req_seq_lens_buffer[: seq_lens.shape[0]]
+                per_req_seq_lens.copy_(seq_lens[:, -1])
+
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
@@ -1705,6 +1718,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 indices=decode_indices,
                 global_seq_lens=global_seq_lens_for_decode,
                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
+                per_req_seq_lens=per_req_seq_lens,
                 decode_is_uniform=write_is_uniform,
                 write_max_decode_len=max_decode_len,
             )
