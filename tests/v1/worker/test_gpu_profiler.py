@@ -17,7 +17,11 @@ from vllm.config import (
 )
 from vllm.config.profiler import _is_uri_path
 from vllm.platforms import current_platform
-from vllm.profiler.wrapper import ProtonProfilerWrapper, WorkerProfiler
+from vllm.profiler.wrapper import (
+    ProtonProfilerWrapper,
+    TorchProfilerWrapper,
+    WorkerProfiler,
+)
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
@@ -247,6 +251,57 @@ def test_mixed_delay_and_stop(default_profiler_config):
     profiler.step()
 
     assert profiler.start_call_count == 0
+
+
+def test_torch_profiler_detailed_iterations_switch_sessions(tmp_path):
+    config = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(tmp_path),
+        torch_profiler_with_stack=False,
+        torch_profiler_dump_cuda_time_total=False,
+        torch_profiler_detailed_iterations=2,
+    )
+    timing, detailed = MagicMock(), MagicMock()
+
+    with patch(
+        "vllm.profiler.wrapper.torch.profiler.profile", side_effect=[timing, detailed]
+    ) as profile:
+        wrapper = TorchProfilerWrapper(
+            config, worker_name="worker", local_rank=0, activities=["CPU", "CUDA"]
+        )
+        wrapper.start()
+        assert profile.call_count == 2
+        wrapper.step()
+        wrapper.step()
+        timing.start.assert_not_called()
+        wrapper.step()
+        detailed.stop.assert_called_once_with()
+        timing.start.assert_called_once_with()
+        wrapper.stop()
+
+    timing_kwargs = profile.call_args_list[0].kwargs
+    detailed_kwargs = profile.call_args_list[1].kwargs
+    assert detailed_kwargs["with_stack"] and detailed_kwargs["record_shapes"]
+    assert not timing_kwargs["with_stack"] and not timing_kwargs["record_shapes"]
+    assert detailed_kwargs["on_trace_ready"] is not timing_kwargs["on_trace_ready"]
+    for profiler in (detailed, timing):
+        profiler.start.assert_called_once_with()
+        profiler.stop.assert_called_once_with()
+
+
+def test_torch_profiler_detailed_iterations_require_torch_profiler():
+    with pytest.raises(ValueError, match="only applicable"):
+        ProfilerConfig(torch_profiler_detailed_iterations=2)
+
+
+def test_torch_profiler_detailed_iterations_reject_schedule():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir="/tmp/mock",
+            torch_profiler_detailed_iterations=2,
+            warmup_iterations=1,
+        )
 
 
 class TestIsUriPath:
