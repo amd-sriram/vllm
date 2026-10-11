@@ -289,6 +289,39 @@ def test_torch_profiler_detailed_iterations_switch_sessions(tmp_path):
         profiler.stop.assert_called_once_with()
 
 
+def test_torch_profiler_detailed_save_failure_keeps_profiling(tmp_path):
+    config = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(tmp_path),
+        torch_profiler_with_stack=False,
+        torch_profiler_dump_cuda_time_total=False,
+        torch_profiler_detailed_iterations=2,
+    )
+    timing, detailed = MagicMock(), MagicMock()
+    detailed.stop.side_effect = OSError(122, "Disk quota exceeded")
+
+    with (
+        patch(
+            "vllm.profiler.wrapper.torch.profiler.profile",
+            side_effect=[timing, detailed],
+        ),
+        patch("vllm.profiler.wrapper.logger") as log,
+    ):
+        wrapper = TorchProfilerWrapper(
+            config, worker_name="worker", local_rank=3, activities=["CPU", "CUDA"]
+        )
+        wrapper.start()
+        for _ in range(3):
+            wrapper.step()
+        timing.start.assert_called_once_with()
+        wrapper.stop()
+
+    timing.stop.assert_called_once_with()
+    _, rank, path, error = log.warning.call_args.args
+    assert (rank, path) == (3, str(tmp_path))
+    assert isinstance(error, OSError)
+
+
 def test_torch_profiler_detailed_iterations_require_torch_profiler():
     with pytest.raises(ValueError, match="only applicable"):
         ProfilerConfig(torch_profiler_detailed_iterations=2)
