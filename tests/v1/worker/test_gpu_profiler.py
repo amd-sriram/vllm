@@ -27,6 +27,7 @@ from vllm.profiler.wrapper import (
     validate_worker_profiler_config,
 )
 from vllm.v1.core.sched.output import CachedRequestData
+from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.xpu_worker import XPUWorker
@@ -627,6 +628,52 @@ def test_profiler_entered_during_capture():
 
     mock_profiler.__enter__.assert_called_once()
     mock_profiler.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize("profiling", [True, False])
+def test_capture_warms_up_off_the_record(profiling):
+    events = []
+
+    class Profiler:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, *exc):
+            events.append("exit")
+
+    def create_forward_fn(desc, warmup):
+        events.append(("create", warmup))
+        return events.append
+
+    manager = MagicMock(ubatch_runner=None, use_breakable_cg=False)
+    manager._capture_descs = {
+        CUDAGraphMode.PIECEWISE: [
+            SimpleNamespace(num_tokens=4, cg_mode=CUDAGraphMode.PIECEWISE)
+        ]
+    }
+    manager._capture_torch_profiler.return_value = (
+        Profiler() if profiling else nullcontext()
+    )
+    with (
+        patch("vllm.v1.worker.gpu.cudagraph_utils.graph_capture"),
+        patch(
+            "vllm.v1.worker.gpu.cudagraph_utils.is_global_first_rank",
+            return_value=False,
+        ),
+    ):
+        CudaGraphManager.capture(manager, create_forward_fn)
+
+    recorded = [("create", True), CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE]
+    if profiling:
+        assert events == [
+            ("create", True),
+            CUDAGraphMode.NONE,
+            "enter",
+            *recorded,
+            "exit",
+        ]
+    else:
+        assert events == recorded
 
 
 def make_proton(session_id: int | None = 7):
