@@ -408,7 +408,15 @@ class TorchProfilerWrapper(WorkerProfiler):
 
     def _end_detailed_session(self) -> None:
         """Save the detailed trace and keep profiling with the configured settings."""
-        self.profiler.stop()
+        try:
+            self.profiler.stop()
+        except Exception as e:
+            logger.warning(
+                "Rank %s: failed to save the detailed profiler trace to %s: %s",
+                self.local_rank,
+                self.profiler_config.torch_profiler_dir,
+                e,
+            )
         self.profiler = torch.profiler.profile(**self._profiler_kwargs)
         self._version_metadata_added = False
         self.profiler.start()
