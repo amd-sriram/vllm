@@ -464,6 +464,10 @@ class CudaGraphManager:
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
+                    if not isinstance(profiler, nullcontext):
+                        # Off the record: first-call work (e.g. lazily zeroed
+                        # buffers) must not land in the recorded warm-up.
+                        create_forward_fn(desc, warmup=True)(CUDAGraphMode.NONE)
                     with profiler:
                         # Prepare inputs and get forward function
                         forward_fn = create_forward_fn(desc, warmup=True)
