@@ -977,7 +977,8 @@ def test_models_fse_init(
     [
         ("tensor_parallel_size", 4, None),
         ("tensor_parallel_size", 8, None),
-        ("tensor_parallel_size", 2, "tensor_parallel_size is 2"),
+        ("tensor_parallel_size", 2, None),
+        ("tensor_parallel_size", 1, "tensor_parallel_size is 1"),
         ("data_parallel_size", 2, "data_parallel_size is 2"),
         ("prefill_context_parallel_size", 2, "prefill_context_parallel_size is 2"),
         ("enable_expert_parallel", True, "expert parallelism is enabled"),
