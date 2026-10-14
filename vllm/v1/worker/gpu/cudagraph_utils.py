@@ -4,7 +4,7 @@ import gc
 import itertools
 from collections import defaultdict
 from collections.abc import Callable, Iterable
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, replace
 from itertools import groupby, product
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
@@ -28,6 +28,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_pp_group,
+    get_world_group,
     graph_capture,
     is_global_first_rank,
 )
@@ -408,6 +409,36 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def _capture_torch_profiler(self):
+        # Memory-estimate captures are discarded and must not be traced.
+        if self._capture_mem_samples is not None:
+            return nullcontext()
+        local_rank = get_world_group().local_rank
+        cfg = self.vllm_config.profiler_config
+        if local_rank != 0 or not cfg.capture_torch_profiler:
+            return nullcontext()
+        trace_dir = cfg.torch_profiler_dir + "/capture_traces"
+        logger.info(
+            "Rank %d: Torch profiler enabled for CUDA graph capture, "
+            "traces will be saved to: %s",
+            local_rank,
+            trace_dir,
+        )
+        return torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                trace_dir,
+                worker_name=f"graph_capture_rank_{local_rank}",
+                use_gzip=True,
+            ),
+        )
+
     def _capture_stream(self, desc: BatchExecutionDescriptor) -> torch.cuda.Stream:
         """Capture on the stream used by the microbatch threads."""
         if desc.num_ubatches > 1:
@@ -432,6 +463,7 @@ class CudaGraphManager:
             progress_bar_desc: Description shown on the capture progress bar.
 
         """
+        profiler = self._capture_torch_profiler()
         with graph_capture(device=self.device), ExitStack() as stack:
             if self.ubatch_runner is not None:
                 # Join parked threads on failure to avoid blocking later captures.
@@ -455,57 +487,71 @@ class CudaGraphManager:
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
-                    # Prepare inputs and get forward function
-                    forward_fn = create_forward_fn(desc, warmup=True)
+                    with profiler:
+                        # Prepare inputs and get forward function
+                        forward_fn = create_forward_fn(desc, warmup=True)
 
-                    # Warmup
-                    forward_fn(CUDAGraphMode.NONE)
-
-                    # Capture
-                    logger.debug(
-                        "CG Capture: mode=%s, batch_desc=%s",
-                        desc.cg_mode.name,
-                        desc,
-                    )
-                    if (
-                        desc.cg_mode == CUDAGraphMode.PIECEWISE
-                        and not self.use_breakable_cg
-                    ):
-                        forward_fn(CUDAGraphMode.PIECEWISE)
-                    else:
-                        # Capture with fresh attention state.
-                        forward_fn = create_forward_fn(desc, warmup=False)
-                        if desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                            forward_fn(CUDAGraphMode.PIECEWISE)
-                            continue
-                        assert desc not in self.graphs, (
-                            f"Graph already captured for {desc}"
-                        )
-                        graph = torch.cuda.CUDAGraph()
-                        # Sync offloader's copy stream before capture.
-                        # Ensure any pre-capture prefetches from offloader are complete.
-                        get_offloader().sync_prev_onload()
-                        if self._capture_mem_samples is not None:
-                            torch.accelerator.synchronize()
-                            free_before = torch.accelerator.get_memory_info()[0]
-                        with (
-                            capture_pool(self.pool, self.vllm_config) as pool,
-                            torch.cuda.graph(
-                                graph, pool, stream=self._capture_stream(desc)
-                            ),
+                        # Warmup. Recorded in the same capture trace, under its own
+                        # span: it runs eagerly the same code the capture records,
+                        # so its kernels name (and put on a stream) each launch
+                        # the capture records without a kernel name.
+                        with torch.profiler.record_function(
+                            f"warmup_{desc.num_tokens}_{desc.cg_mode.name}"
                         ):
                             forward_fn(CUDAGraphMode.NONE)
-                            # Join offloader's copy stream after forward to avoid
-                            # unjoined stream error. The last layer's start_prefetch
-                            # forks copy_stream, but wait_prefetch only happens in
-                            # the next forward pass.
-                            get_offloader().join_after_forward()
-                        if self._capture_mem_samples is not None:
-                            torch.accelerator.synchronize()
-                            free_after = torch.accelerator.get_memory_info()[0]
-                            self._capture_mem_samples.append(free_before - free_after)
-                        self.graphs[desc] = graph
-                        compilation_counter.num_cudagraph_captured += 1
+
+                        # Capture
+                        logger.debug(
+                            "CG Capture: mode=%s, batch_desc=%s",
+                            desc.cg_mode.name,
+                            desc,
+                        )
+                        with torch.profiler.record_function(
+                            f"capture_{desc.num_tokens}_{desc.cg_mode.name}"
+                        ):
+                            if (
+                                desc.cg_mode == CUDAGraphMode.PIECEWISE
+                                and not self.use_breakable_cg
+                            ):
+                                forward_fn(CUDAGraphMode.PIECEWISE)
+                            else:
+                                # Capture with fresh attention state.
+                                forward_fn = create_forward_fn(desc, warmup=False)
+                                if desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                                    forward_fn(CUDAGraphMode.PIECEWISE)
+                                    continue
+                                assert desc not in self.graphs, (
+                                    f"Graph already captured for {desc}"
+                                )
+                                graph = torch.cuda.CUDAGraph()
+                                # Sync offloader's copy stream before capture.
+                                # Ensure any pre-capture prefetches from
+                                # offloader are complete.
+                                get_offloader().sync_prev_onload()
+                                if self._capture_mem_samples is not None:
+                                    torch.accelerator.synchronize()
+                                    free_before = torch.accelerator.get_memory_info()[0]
+                                with (
+                                    capture_pool(self.pool, self.vllm_config) as pool,
+                                    torch.cuda.graph(
+                                        graph, pool, stream=self._capture_stream(desc)
+                                    ),
+                                ):
+                                    forward_fn(CUDAGraphMode.NONE)
+                                    # Join offloader's copy stream after forward to
+                                    # avoid unjoined stream error. The last layer's
+                                    # start_prefetch forks copy_stream, but
+                                    # wait_prefetch only happens in the next forward
+                                    # pass.
+                                    get_offloader().join_after_forward()
+                                if self._capture_mem_samples is not None:
+                                    torch.accelerator.synchronize()
+                                    free_after = torch.accelerator.get_memory_info()[0]
+                                    self._capture_mem_samples.append(
+                                        free_before - free_after
+                                    )
+                                self.graphs[desc] = graph
+                                compilation_counter.num_cudagraph_captured += 1
 
         self._graphs_captured = True
 
