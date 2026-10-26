@@ -763,6 +763,7 @@ def rocm_fp8_paged_mqa_logits(
     max_model_len: int,
     *,
     compress_ratio: int = 1,
+    per_req_context_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -780,6 +781,9 @@ def rocm_fp8_paged_mqa_logits(
             used to distribute work across SMs.
         max_model_len: Maximum sequence length used to size the logits output.
         compress_ratio: C4A (4) takes block-flat Triton; 1 and 2 stay on AITER.
+        per_req_context_lens: Tensor of shape [B], dtype int32; the last column
+            of a [B, next_n] `context_lens`. The AITER kernels take one length
+            per sequence, so they use it when given.
 
     Returns:
         Logits tensor of shape [B * next_n, max_model_len], dtype
@@ -812,6 +816,8 @@ def rocm_fp8_paged_mqa_logits(
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
 
     if aiter_paged_mqa_logits_module is not None:
+        if per_req_context_lens is not None:
+            context_lens = per_req_context_lens
         if _ON_GFX942 or _ON_GFX950:
             logger.info_once(
                 "Using AITER paged-MQA logits from %s.",
@@ -1388,6 +1394,7 @@ def rocm_aiter_sparse_attn_indexer(
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
             compress_ratio=compress_ratio,
+            per_req_context_lens=decode_metadata.per_req_seq_lens,
         )
 
         if candidate_blocks is not None:
