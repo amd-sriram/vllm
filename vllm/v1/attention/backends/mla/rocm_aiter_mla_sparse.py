@@ -292,6 +292,127 @@ def triton_convert_req_index_to_global_index(
 
 
 @triton.jit
+def _fit_and_convert_kpool_indices_kernel(
+    req_id_ptr,  # int32 [num_tokens]
+    block_table_ptr,  # int32 [num_requests, max_num_blocks_per_req]
+    token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS + TAIL_WIDTH]
+    cu_seqlens_ptr,  # int32 [num_tokens + 1]
+    out_ptr,  # int32 ragged [cu_seqlens[-1]]
+    max_num_blocks_per_req,
+    bt_stride0,
+    bt_stride1,
+    ti_stride0,
+    ti_stride1,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_STRIDE_ROWS: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    TAIL_WIDTH: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_TAIL: tl.constexpr,
+):
+    """_fit_kpool_indices_kernel + _convert_req_index_to_global_index_kernel.
+
+    One program per query token: fit the kpool tail into the fixed top-k
+    width, then map the fitted request-local ids to global KV rows and store
+    them at the token's ragged offset. Same result as the two kernels back to
+    back, one launch instead of two and no int32 [num_tokens, topk] round trip.
+    """
+    token_id = tl.program_id(0)
+    seq_start = tl.load(cu_seqlens_ptr + token_id)
+    seq_end = tl.load(cu_seqlens_ptr + token_id + 1)
+    if seq_start >= seq_end:
+        return
+
+    row_ptr = token_indices_ptr + token_id * ti_stride0
+    columns = tl.arange(0, BLOCK_T)
+    column_mask = columns < NUM_TOPK_TOKENS
+    history = tl.load(row_ptr + columns * ti_stride1, mask=column_mask, other=-1)
+
+    if TAIL_WIDTH > 0:
+        tail_columns = tl.arange(0, BLOCK_TAIL)
+        tail = tl.load(
+            row_ptr + (NUM_TOPK_TOKENS + tail_columns) * ti_stride1,
+            mask=tail_columns < TAIL_WIDTH,
+            other=-1,
+        )
+        valid_history = tl.sum((history >= 0).to(tl.int32))
+        valid_tail = tl.sum((tail >= 0).to(tl.int32))
+        keep_history = tl.minimum(valid_history, NUM_TOPK_TOKENS - valid_tail)
+        tail_offsets = columns - keep_history
+        tail_values = tl.load(
+            row_ptr + (NUM_TOPK_TOKENS + tail_offsets) * ti_stride1,
+            mask=column_mask & (tail_offsets >= 0) & (tail_offsets < TAIL_WIDTH),
+            other=-1,
+        )
+        tok = tl.where(columns < keep_history, history, tail_values)
+        tok = tl.where(columns < keep_history + valid_tail, tok, -1)
+    else:
+        tok = history
+
+    req = tl.load(req_id_ptr + token_id)
+    block_id = tok // BLOCK_SIZE
+    inblock_off = tok % BLOCK_SIZE
+    valid_block = (block_id < max_num_blocks_per_req) & (block_id >= 0)
+    base = tl.load(
+        block_table_ptr + req * bt_stride0 + block_id * bt_stride1,
+        mask=column_mask & valid_block,
+        other=0,
+    )
+    out_val = tl.where(
+        (tok < 0) | (~valid_block), 0, base * BLOCK_STRIDE_ROWS + inblock_off
+    )
+    tl.store(
+        out_ptr + seq_start + columns,
+        out_val,
+        mask=column_mask & ((seq_start + columns) < seq_end),
+    )
+
+
+def fit_and_convert_kpool_indices(
+    req_id: torch.Tensor,  # int32 [num_tokens]
+    block_table: torch.Tensor,  # int32 [num_requests, max_num_blocks_per_req]
+    token_indices: torch.Tensor,  # int32 [num_tokens, topk + tail]
+    cu_seqlens: torch.Tensor,  # int32 [num_tokens + 1]
+    paged_kv_indices: torch.Tensor,  # int32 ragged out buffer
+    BLOCK_STRIDE_ROWS: int,
+    BLOCK_SIZE: int,
+    NUM_TOPK_TOKENS: int,
+) -> None:
+    """fit_kpool_indices_to_aiter + triton_convert_req_index_to_global_index
+    in one launch. Writes 0, never -1, for an invalid entry, like the
+    two-kernel path."""
+    assert req_id.dtype == torch.int32
+    assert block_table.dtype == torch.int32
+    assert token_indices.dtype == torch.int32
+    num_tokens, width = token_indices.shape
+    assert req_id.shape[0] == num_tokens
+    if width < NUM_TOPK_TOKENS:
+        raise ValueError("token_indices width must be at least topk_tokens")
+    if num_tokens == 0:
+        return
+    tail_width = width - NUM_TOPK_TOKENS
+    _fit_and_convert_kpool_indices_kernel[(num_tokens,)](
+        req_id,
+        block_table,
+        token_indices,
+        cu_seqlens,
+        paged_kv_indices,
+        block_table.shape[1],
+        block_table.stride(0),
+        block_table.stride(1),
+        token_indices.stride(0),
+        token_indices.stride(1),
+        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_STRIDE_ROWS=BLOCK_STRIDE_ROWS,
+        NUM_TOPK_TOKENS=NUM_TOPK_TOKENS,
+        TAIL_WIDTH=tail_width,
+        BLOCK_T=triton.next_power_of_2(NUM_TOPK_TOKENS),
+        BLOCK_TAIL=triton.next_power_of_2(max(tail_width, 1)),
+        num_warps=8,
+    )
+
+
+@triton.jit
 def generate_sparse_seqlen_kernel(
     seq_len_ptr,  # [num_seq]
     cu_query_lens_ptr,  # [num_seq]
@@ -1147,7 +1268,7 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
             q_scale=layer._q_scale,
             kv_scale=layer._k_scale,
             attn_sink=self.sinks,
-            # triton_convert_req_index_to_global_index writes 0, never -1,
+            # fit_and_convert_kpool_indices writes 0, never -1,
             # for an invalid top-k entry, so no slot in the stream is negative.
             has_invalid=False,
         )
@@ -1192,20 +1313,18 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
             or attn_metadata.remapped_epoch != self.index_epoch
             or attn_metadata.remapped_buf is not self.topk_indices_buffer
         ):
-            # Get topk indices
+            # Fit the kpool tail into the fixed top-k width and remap to
+            # global KV rows in one launch (was _fit_kpool_indices_kernel +
+            # _convert_req_index_to_global_index_kernel).
             assert self.topk_indices_buffer is not None
-            topk_indices = fit_kpool_indices_to_aiter(
-                self.topk_indices_buffer[:num_actual_toks], attn_metadata.topk_tokens
-            )
-
-            triton_convert_req_index_to_global_index(
+            fit_and_convert_kpool_indices(
                 attn_metadata.req_id_per_token[:num_actual_toks],
                 attn_metadata.block_table,
-                topk_indices,
+                self.topk_indices_buffer[:num_actual_toks],
                 attn_metadata.paged_kv_indptr,
                 attn_metadata.paged_kv_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
                 BLOCK_STRIDE_ROWS=block_stride_rows,
+                BLOCK_SIZE=attn_metadata.block_size,
                 NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
             )
             attn_metadata.remapped_buf = self.topk_indices_buffer
