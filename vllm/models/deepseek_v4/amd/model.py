@@ -709,6 +709,12 @@ class DeepseekV4MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+            if fuse_heterogeneous_shared_expert or fuse_mega_moe_shared_expert:
+                # The fused MoE copies these weights after the linears' own
+                # post-load step, so that step must leave them in the plain
+                # checkpoint layout.
+                self.shared_experts.gate_up_proj.skip_weight_relayout = True
+                self.shared_experts.down_proj.skip_weight_relayout = True
 
         self.tp_rank = get_tensor_model_parallel_rank()
         assert config.n_routed_experts % self.tp_size == 0

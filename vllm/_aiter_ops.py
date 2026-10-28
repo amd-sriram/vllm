@@ -4438,6 +4438,43 @@ class rocm_aiter_ops:
         return _ck_gemm_shape_is_tuned(N, K, q_dtype_w, "AITER_CONFIG_GEMM_A8W8_FILE")
 
     @staticmethod
+    @functools.cache
+    def is_blockscale_bpreshuffle_tuned(n: int, k: int) -> bool:
+        """Whether aiter has a tuned blockscale bpreshuffle config for (N, K).
+
+        A weight is shuffled once at load and then serves every batch size,
+        so probe M values from decode to prefill through aiter's own lookup
+        (which pads M) rather than M=1 alone: some shapes are tuned for
+        prefill-sized M only.
+        """
+        if not current_platform.is_rocm():
+            return False
+        from aiter.jit.core import AITER_CONFIGS
+        from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
+
+        config_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+        sample_m = (
+            32768,
+            8192,
+            4096,
+            2048,
+            1024,
+            512,
+            256,
+            128,
+            64,
+            32,
+            16,
+            8,
+            4,
+            2,
+            1,
+        )
+        return any(
+            get_CKGEMM_config(m, n, k, config_file) is not None for m in sample_m
+        )
+
+    @staticmethod
     def shuffle_weight(
         tensor: torch.Tensor, layout: tuple[int, int] = (16, 16)
     ) -> torch.Tensor:
