@@ -6,11 +6,15 @@ import torch
 
 # this import will also register the custom ops
 # import vllm.model_executor.kernels.mhc  # noqa: F401
+import vllm.envs as envs
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from vllm._aiter_ops import is_aiter_found_and_supported
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
+
+logger = init_logger(__name__)
 
 
 def _has_tilelang_mhc() -> bool:
@@ -41,7 +45,7 @@ def _has_aiter_mhc_fused() -> bool:
     return callable(mhc_fused_post_pre)
 
 
-def _aiter_mhc_op_accepts_norm(op_name: str) -> bool:
+def _aiter_mhc_op_accepts(op_name: str, *arg_names: str) -> bool:
     if not HAS_AITER_MHC:
         return False
     try:
@@ -52,11 +56,15 @@ def _aiter_mhc_op_accepts_norm(op_name: str) -> bool:
             if op is None:
                 continue
             parameters = inspect.signature(op).parameters
-            if "norm_weight" in parameters and "norm_eps" in parameters:
+            if all(name in parameters for name in arg_names):
                 return True
     except (AttributeError, ImportError, TypeError, ValueError):
         pass
     return False
+
+
+def _aiter_mhc_op_accepts_norm(op_name: str) -> bool:
+    return _aiter_mhc_op_accepts(op_name, "norm_weight", "norm_eps")
 
 
 def _has_aiter_mhc_fused_post_pre_delayed_rms_norm() -> bool:
@@ -74,6 +82,47 @@ HAS_AITER_MHC_FUSED_NORM = _aiter_mhc_op_accepts_norm("mhc_fused_post_pre")
 HAS_AITER_MHC_FUSED_POST_PRE_DELAYED_RMS_NORM = (
     _has_aiter_mhc_fused_post_pre_delayed_rms_norm()
 )
+
+
+def _has_aiter_mhc_packed_bf16() -> bool:
+    if not (
+        HAS_AITER_MHC_FUSED and HAS_AITER_MHC_FUSED_NORM and HAS_AITER_MHC_PRE_NORM
+    ):
+        return False
+    from vllm.platforms.rocm import on_gfx950
+
+    # The packed BF16 hi/lo pre GEMM (wave64 bf16 MFMA) is only validated
+    # and tuned on gfx950.
+    if not on_gfx950():
+        return False
+    try:
+        from aiter.ops.mhc import mhc_shuffle_fn  # noqa: F401
+    except ImportError:
+        return False
+    return _aiter_mhc_op_accepts("mhc_pre", "w_preshuffle_bf16") and (
+        _aiter_mhc_op_accepts("mhc_fused_post_pre", "w_preshuffle_bf16", "force_fused")
+    )
+
+
+HAS_AITER_MHC_PACKED_BF16 = _has_aiter_mhc_packed_bf16()
+
+
+def mhc_packed_bf16_min_tokens() -> int:
+    """Token count from which AITER mHC uses packed BF16 hi/lo weights.
+
+    VLLM_ROCM_MHC_PACKED_BF16_MIN_TOKENS when set and supported, else 0 (off).
+    """
+    min_tokens = envs.VLLM_ROCM_MHC_PACKED_BF16_MIN_TOKENS
+    if min_tokens <= 0:
+        return 0
+    if not HAS_AITER_MHC_PACKED_BF16:
+        logger.warning_once(
+            "VLLM_ROCM_MHC_PACKED_BF16_MIN_TOKENS=%d ignored: AITER packed "
+            "BF16 mHC weights need gfx950 and an AITER with mhc_shuffle_fn.",
+            min_tokens,
+        )
+        return 0
+    return min_tokens
 
 
 def _aiter_mhc_supported(
@@ -163,7 +212,10 @@ class MHCPreOp(CustomOp):
         n_splits: int = 1,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        fn_packed: torch.Tensor | None = None,
+        packed_min_tokens: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # fn_packed / packed_min_tokens: AITER only (see mhc_pre_aiter).
         if _aiter_mhc_supported(
             residual,
             norm_weight,
@@ -182,6 +234,8 @@ class MHCPreOp(CustomOp):
                 n_splits,
                 norm_weight,
                 norm_eps,
+                fn_packed,
+                packed_min_tokens,
             )
         elif HAS_TILELANG_MHC:
             return torch.ops.vllm.mhc_pre_tilelang(
@@ -835,7 +889,10 @@ class MHCFusedPostPreOp(CustomOp):
         tile_n: int = 1,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        fn_packed: torch.Tensor | None = None,
+        packed_min_tokens: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # fn_packed / packed_min_tokens: AITER only (see mhc_pre_aiter).
         if HAS_AITER_MHC_FUSED and _aiter_mhc_supported(
             residual,
             norm_weight,
@@ -858,6 +915,8 @@ class MHCFusedPostPreOp(CustomOp):
                 tile_n,
                 norm_weight,
                 norm_eps,
+                fn_packed,
+                packed_min_tokens,
             )
         if HAS_TILELANG_MHC:
             return torch.ops.vllm.mhc_fused_post_pre_tilelang(

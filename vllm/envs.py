@@ -148,6 +148,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
     VLLM_ROCM_AITER_MLA_DCP_VERIFY: Literal["auto", "asm", "segmented"] = "auto"
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_ROCM_MHC_PACKED_BF16_MIN_TOKENS: int = 0
     VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = False
@@ -1347,6 +1348,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+    ),
+    # mHC (GLM-5.3-Flash) on gfx950: steps with at least this many tokens run
+    # the mHC pre GEMM on packed BF16 hi/lo weights (AITER mhc_shuffle_fn,
+    # w_preshuffle_bf16) and force AITER's fused post+pre path; smaller steps
+    # keep the FP32 weights. 0 (default) disables it and keeps no packed copy.
+    "VLLM_ROCM_MHC_PACKED_BF16_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_ROCM_MHC_PACKED_BF16_MIN_TOKENS", "0")
     ),
     # Whether sparse MLA prefill and decode run on aiter's Triton kernel, which
     # reads the KV cache as stored (bf16 or fp8, paged or flat). Used by the

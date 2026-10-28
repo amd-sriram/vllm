@@ -4744,12 +4744,14 @@ class rocm_aiter_ops:
         sinkhorn_repeat: int,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        w_preshuffle_bf16: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass for mHC pre block.
 
         Args:
             residual: shape (..., hc_mult, hidden_size), dtype torch.bfloat16
-            fn: shape (hc_mult3, hc_mult * hidden_size), dtype torch.float32
+            fn: shape (hc_mult3, hc_mult * hidden_size), dtype torch.float32,
+                or torch.int32 from ``mhc_shuffle_fn`` when w_preshuffle_bf16
             hc_scale: shape (3,), dtype torch.float32
             hc_base: shape (hc_mult3,), dtype torch.float32
             rms_eps: RMS normalization epsilon
@@ -4759,6 +4761,8 @@ class rocm_aiter_ops:
             sinkhorn_repeat: number of sinkhorn iterations
             norm_weight: optional RMSNorm weight fused into the pre kernel
             norm_eps: epsilon for the fused RMSNorm when norm_weight is set
+            w_preshuffle_bf16: fn is packed BF16 hi/lo; the GEMM runs on
+                BF16 MFMA instead of FP32 MFMA
 
         Returns:
             post_mix: shape (..., hc_mult), dtype torch.float32
@@ -4770,7 +4774,7 @@ class rocm_aiter_ops:
 
         # Validate shapes
         assert residual.dtype == torch.bfloat16
-        assert fn.dtype == torch.float32
+        assert fn.dtype == (torch.int32 if w_preshuffle_bf16 else torch.float32)
         assert hc_scale.dtype == torch.float32
         assert hc_base.dtype == torch.float32
 
@@ -4828,7 +4832,11 @@ class rocm_aiter_ops:
                 hc_post_mult_value,
                 sinkhorn_repeat,
             )
-            if norm_weight is None:
+            if w_preshuffle_bf16:
+                post_mix, comb_mix, layer_input = mhc_pre(
+                    *args, norm_weight, norm_eps, w_preshuffle_bf16=1
+                )
+            elif norm_weight is None:
                 post_mix, comb_mix, layer_input = mhc_pre(*args)
             else:
                 post_mix, comb_mix, layer_input = mhc_pre(*args, norm_weight, norm_eps)
@@ -5147,17 +5155,23 @@ class rocm_aiter_ops:
         sinkhorn_repeat: int,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        w_preshuffle_bf16: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Fused mHC post + next mHC pre via AITER.
 
         Returns residual_cur, post_mix, comb_mix, layer_input in vLLM order
         (AITER returns post_mix, comb_mix, layer_input, next_residual).
+
+        ``w_preshuffle_bf16``: fn is packed BF16 hi/lo (``mhc_shuffle_fn``);
+        also sets AITER's ``force_fused``, so gfx950 large-M runs the tuned
+        packed fused rows where AITER has them and its large-M post + pre
+        specialization otherwise.
         """
         from aiter.ops.mhc import mhc_fused_post_pre
 
         assert x.dtype == torch.bfloat16
         assert residual.dtype == torch.bfloat16
-        assert fn.dtype == torch.float32
+        assert fn.dtype == (torch.int32 if w_preshuffle_bf16 else torch.float32)
         assert hc_scale.dtype == torch.float32
         assert hc_base.dtype == torch.float32
 
@@ -5211,7 +5225,15 @@ class rocm_aiter_ops:
             sinkhorn_repeat,
         )
         with torch.device(residual_flat.device):
-            if norm_weight is None:
+            if w_preshuffle_bf16:
+                result = mhc_fused_post_pre(
+                    *args,
+                    norm_weight,
+                    norm_eps,
+                    force_fused=True,
+                    w_preshuffle_bf16=True,
+                )
+            elif norm_weight is None:
                 result = mhc_fused_post_pre(*args)
             else:
                 result = mhc_fused_post_pre(*args, norm_weight, norm_eps)
