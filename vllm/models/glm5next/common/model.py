@@ -92,6 +92,11 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 
+if current_platform.is_rocm():
+    from vllm.models.glm5next.amd import prefill_sp
+else:
+    prefill_sp = None
+
 from .attention import Glm5NextMLAAttention
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
@@ -162,6 +167,21 @@ def _is_kda_layer(config: Glm5NextTextConfig, layer_idx: int) -> bool:
 def _is_linear_attn(config: Glm5NextTextConfig) -> bool:
     layer_types = config.layer_types
     return layer_types is not None and "linear_attention" in layer_types
+
+
+def _prefill_sp_min_tokens(parallel_config, config: Glm5NextTextConfig) -> int:
+    """The ROCm token-sharded prefill threshold (0 when it does not apply).
+
+    Only the mHC decoder layers shard; expert-parallel sequence parallelism
+    already shards every step and keeps its own path.
+    """
+    if (
+        prefill_sp is None
+        or not config.mhc
+        or parallel_config.use_sequence_parallel_moe
+    ):
+        return 0
+    return prefill_sp.prefill_sp_min_tokens()
 
 
 def _validate_supported_config(config: Glm5NextTextConfig) -> None:
@@ -237,6 +257,7 @@ class Glm5NextMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         apply_routed_scale_to_output: bool = False,
+        defer_reduce: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -328,6 +349,9 @@ class Glm5NextMoE(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
+            # With token-sharded prefill the decoder layer finishes the TP sum
+            # (reduce-scatter on sharded steps, all-reduce otherwise).
+            reduce_results=not defer_reduce,
             n_shared_experts=config.n_shared_experts
             if self.is_fused_shared_expert_enabled
             else None,
@@ -393,6 +417,12 @@ class Glm5NextDecoderLayer(nn.Module):
         is_kda_layer = not is_mtp_layer and _is_kda_layer(config, layer_idx)
         self.layer_kind = "kda" if is_kda_layer else "mla"
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        # ROCm token-sharded prefill: the attention and MLP outputs leave TP
+        # partial sums that forward() reduce-scatters (sharded steps) or
+        # all-reduces (all other steps).
+        self.prefill_sp = (
+            not is_mtp_layer and _prefill_sp_min_tokens(parallel_config, config) > 0
+        )
 
         if is_kda_layer:
             self.self_attn = Glm5NextLinearAttention(
@@ -438,6 +468,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                defer_reduce=self.prefill_sp,
             )
         else:
             self.mlp = Glm5NextMLP(
@@ -445,6 +476,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=not self.prefill_sp,
                 is_sequence_parallel=self.is_sequence_parallel,
                 prefix=f"{prefix}.mlp",
                 swiglu_limit=config.swiglu_limit,
@@ -456,7 +488,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # decoder-layer reduce_scatter after attention completes it (DSv4 pattern).
         # MTP layers use the non-mHC path which has no sp_reduce_scatter, so
         # their o_proj must still reduce normally.
-        if self.is_sequence_parallel and not is_mtp_layer:
+        if (self.is_sequence_parallel and not is_mtp_layer) or self.prefill_sp:
             self.self_attn.o_proj.reduce_results = False
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -545,6 +577,7 @@ class Glm5NextDecoderLayer(nn.Module):
         residual: torch.Tensor | None = None,
         post: torch.Tensor | None = None,
         comb: torch.Tensor | None = None,
+        sp: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -607,6 +640,8 @@ class Glm5NextDecoderLayer(nn.Module):
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if self.is_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
+        elif sp:
+            x = prefill_sp.gather(x, positions.shape[0])
 
         x = self.self_attn(
             hidden_states=x,
@@ -615,6 +650,10 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
+        elif sp:
+            x = prefill_sp.scatter(x)
+        elif self.prefill_sp:
+            x = prefill_sp.all_reduce(x)
 
         # Fuse post-attn hc_post + pre-FFN hc_pre (+ RMSNorm) into one kernel.
         residual, post, comb, x = self.hc_fused_post_pre(
@@ -630,10 +669,16 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
         # Fully Connected
+        if sp:
+            x = prefill_sp.gather(x, positions.shape[0])
         if self._mlp_is_moe:
             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
         else:
             x = self.mlp(x)
+        if sp:
+            x = prefill_sp.scatter(x)
+        elif self.prefill_sp:
+            x = prefill_sp.all_reduce(x)
 
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
@@ -778,6 +823,11 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
+        self.prefill_sp_min_tokens = _prefill_sp_min_tokens(
+            vllm_config.parallel_config, config
+        )
+        if self.prefill_sp_min_tokens:
+            prefill_sp.init_collectives()
         self.vllm_config = vllm_config
         self.specialized_decode_config = _specialized_decode_config(vllm_config)
         self.specialized_decode: Any = None
@@ -849,6 +899,16 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
         decode = self.specialized_decode
         step = None if decode is None else decode.plan(positions, intermediate_tensors)
+        # Token-sharded prefill (ROCm): never on MonoKernel steps, in graph
+        # capture or with aux hidden states (EAGLE).
+        sp = (
+            self.prefill_sp_min_tokens > 0
+            and step is None
+            and not self.aux_hidden_state_layers
+            and prefill_sp.should_shard(full_num_tokens, self.prefill_sp_min_tokens)
+        )
+        if sp:
+            hidden_states = prefill_sp.shard(hidden_states)
         aux_hidden_states: list[torch.Tensor] = []
         for idx, layer in enumerate(self._active_layers, start=self.start_layer):
             if idx in self.aux_hidden_state_layers:
@@ -859,9 +919,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
             kernel = step.layer(idx) if step is not None else None
-            hidden_states, residual, post, comb = (kernel or layer)(
-                positions, hidden_states, residual, post, comb
-            )
+            if kernel is not None:
+                hidden_states, residual, post, comb = kernel(
+                    positions, hidden_states, residual, post, comb
+                )
+            else:
+                hidden_states, residual, post, comb = layer(
+                    positions, hidden_states, residual, post, comb, sp=sp
+                )
 
         if not get_pp_group().is_last_rank:
             # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
@@ -881,6 +946,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        elif sp:
+            hidden_states = prefill_sp.gather(hidden_states, full_num_tokens)
 
         hidden_states = self.norm(hidden_states)
         if aux_hidden_states:

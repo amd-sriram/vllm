@@ -158,6 +158,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
+    VLLM_ROCM_GLM5_PREFILL_SP_MIN_TOKENS: int = 0
+    VLLM_ROCM_GLM5_PREFILL_SP_RS: str = "int4"
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
@@ -1396,6 +1398,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
     # Pad the weights for the moe kernel
     "VLLM_ROCM_MOE_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_MOE_PADDING", "1"))),
+    # GLM-5.x (Glm5Next) on ROCm with TP > 1: eager steps with at least this
+    # many tokens run with the mHC residual stream sharded over tokens
+    # (sequence parallel): each all-reduce becomes a reduce-scatter plus an
+    # all-gather before the next block. 0 (default) disables it.
+    "VLLM_ROCM_GLM5_PREFILL_SP_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_ROCM_GLM5_PREFILL_SP_MIN_TOKENS", "0")
+    ),
+    # Reduce-scatter backend for VLLM_ROCM_GLM5_PREFILL_SP_MIN_TOKENS:
+    # "int4" (AITER QuickReduce INT4 codec, TP4 only; needs
+    # AITER_QUICK_REDUCE_QUANTIZATION=INT4), "aiter" (AITER custom bf16) or
+    # "nccl".
+    "VLLM_ROCM_GLM5_PREFILL_SP_RS": lambda: os.getenv(
+        "VLLM_ROCM_GLM5_PREFILL_SP_RS", "int4"
+    ).lower(),
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
