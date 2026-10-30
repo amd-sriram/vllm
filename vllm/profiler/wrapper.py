@@ -225,6 +225,22 @@ TorchProfilerActivityMap = {
 }
 
 
+def graph_capture_profiler_config(profiler_config: ProfilerConfig) -> ProfilerConfig:
+    """Apply one-shot graph-capture overrides to a profiler config."""
+    return replace(
+        profiler_config,
+        delay_iterations=0,
+        max_iterations=0,
+        warmup_iterations=0,
+        wait_iterations=0,
+        torch_profiler_record_shapes=True,
+        torch_profiler_with_stack=True,
+        torch_profiler_dir=os.path.join(
+            profiler_config.torch_profiler_dir, "capture_traces"
+        ),
+    )
+
+
 class TorchProfilerWrapper(WorkerProfiler):
     def __init__(
         self,
@@ -306,6 +322,20 @@ class TorchProfilerWrapper(WorkerProfiler):
         self._profiler_kwargs = dict(self._base_profiler_kwargs)
         if profiler_kwargs:
             self._profiler_kwargs.update(profiler_kwargs)
+        self._detailed_iters = profiler_config.torch_profiler_detailed_iterations
+        self._detailed_steps_remaining = 0
+        if self._detailed_iters > 0:
+            self._detailed_profiler_kwargs = dict(
+                self._profiler_kwargs,
+                record_shapes=True,
+                with_stack=True,
+                on_trace_ready=on_trace_ready
+                or torch.profiler.tensorboard_trace_handler(
+                    torch_profiler_trace_dir,
+                    worker_name=f"{worker_name}_detailed",
+                    use_gzip=profiler_config.torch_profiler_use_gzip,
+                ),
+            )
         self.profiler: torch.profiler.profile
 
         # Track if we're using a schedule (need to call step())
@@ -335,6 +365,14 @@ class TorchProfilerWrapper(WorkerProfiler):
                 use_gzip=self._torch_profiler_use_gzip,
             )
         )
+        if self._detailed_iters > 0:
+            self._detailed_profiler_kwargs["on_trace_ready"] = (
+                torch.profiler.tensorboard_trace_handler(
+                    self._torch_profiler_trace_dir,
+                    worker_name=f"{worker_name}_detailed",
+                    use_gzip=self._torch_profiler_use_gzip,
+                )
+            )
 
     @override
     def set_profiler_kwargs(self, profiler_kwargs: dict | None) -> None:
@@ -401,9 +439,21 @@ class TorchProfilerWrapper(WorkerProfiler):
         # Mark done even on failure, to avoid retrying every step.
         self._version_metadata_added = True
 
+    def build_profiler(self) -> torch.profiler.profile:
+        """Build one unstarted profiler from the current settings."""
+        return torch.profiler.profile(**self._profiler_kwargs)
+
     @override
     def _start(self) -> None:
-        self.profiler = torch.profiler.profile(**self._profiler_kwargs)
+        # step() runs at the start of each iteration, so switch on the call
+        # after the Nth one.
+        self._detailed_steps_remaining = (
+            self._detailed_iters + 1 if self._detailed_iters > 0 else 0
+        )
+        if self._detailed_steps_remaining > 0:
+            self.profiler = torch.profiler.profile(**self._detailed_profiler_kwargs)
+        else:
+            self.profiler = self.build_profiler()
         self._warmup_steps_remaining = self._initial_warmup_steps_remaining
         self._version_metadata_added = False
         self.profiler.start()
@@ -443,6 +493,11 @@ class TorchProfilerWrapper(WorkerProfiler):
             False if the step was a warmup step (data discarded).
 
         """
+        if self._detailed_steps_remaining > 0:
+            self._detailed_steps_remaining -= 1
+            if self._detailed_steps_remaining == 0:
+                self._end_detailed_session()
+            return True
         if self._uses_schedule:
             self.profiler.step()
             # Stamp once the schedule leaves WAIT and Kineto is live.
@@ -452,6 +507,22 @@ class TorchProfilerWrapper(WorkerProfiler):
                 self._warmup_steps_remaining -= 1
                 return False
         return True
+
+    def _end_detailed_session(self) -> None:
+        """Save the detailed trace and keep profiling with the configured settings."""
+        try:
+            self.profiler.stop()
+        except Exception as e:
+            logger.warning(
+                "Rank %s: failed to save the detailed profiler trace to %s: %s",
+                self.local_rank,
+                self.profiler_config.torch_profiler_dir,
+                e,
+            )
+        self.profiler = torch.profiler.profile(**self._profiler_kwargs)
+        self._version_metadata_added = False
+        self.profiler.start()
+        self._maybe_add_version_metadata()
 
     @property
     @override
