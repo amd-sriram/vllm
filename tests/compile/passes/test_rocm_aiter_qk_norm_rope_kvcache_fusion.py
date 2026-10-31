@@ -103,6 +103,7 @@ class QKNormRoPEKVCacheTestModel(torch.nn.Module):
         dtype: torch.dtype,
         device: torch.device,
         rotary_dim: int | None = None,
+        has_v_norm: bool = False,
         prefix: str = "model.layers.0.self_attn.attn",
         expected_query_quant_group_shape: GroupShape | None = None,
     ):
@@ -118,9 +119,16 @@ class QKNormRoPEKVCacheTestModel(torch.nn.Module):
         self.dtype = dtype
         self.device = device
         self.layer_name = prefix
+        self.has_v_norm = has_v_norm
 
         self.q_norm = RMSNorm(head_size, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_size, eps=rms_norm_eps)
+        # Gemma4 applies a weightless V-norm on every attention layer.
+        self.v_norm = (
+            RMSNorm(head_size, eps=rms_norm_eps, has_weight=False)
+            if has_v_norm
+            else None
+        )
 
         self.rotary_emb = RotaryEmbedding(
             head_size,
@@ -255,6 +263,8 @@ class QKNormRoPEKVCacheTestModel(torch.nn.Module):
         q = q.view(-1, self.num_heads, self.head_size)
         k = k.view(-1, self.num_kv_heads, self.head_size)
         v = v.view(-1, self.num_kv_heads, self.head_size)
+        if self.v_norm is not None:
+            v = self.v_norm(v)
         kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
             k, v, _encode_layer_name(self.layer_name)
         )
@@ -353,6 +363,7 @@ def _run_qk_norm_rope_kvcache_fusion_test(
     kv_cache_dtype: CacheDType,
     rms_norm_eps: float,
     custom_op: str,
+    has_v_norm: bool,
     monkeypatch: pytest.MonkeyPatch,
     mrope_section: tuple[int, int, int] | None = None,
     mrope_interleaved: bool = False,
@@ -423,7 +434,7 @@ def _run_qk_norm_rope_kvcache_fusion_test(
             "expected_query_quant_group_shape": expected_query_quant_group_shape,
         }
         if mrope_section is None:
-            model = QKNormRoPEKVCacheTestModel(**model_kwargs)
+            model = QKNormRoPEKVCacheTestModel(**model_kwargs, has_v_norm=has_v_norm)
         else:
             alternate_section = (8, 8, 8)
             m.setattr(
@@ -571,6 +582,10 @@ _FUSION_CONFIGS = [
     pytest.param(32, 2, 128, 64, False, id="glm4_dense"),
     # Moondream3-style small head (head_size=64, rotary_dim=32)
     pytest.param(16, 2, 64, 32, True, id="partial_small_head"),
+    # Gemma4 sliding-attention layers (head_dim 256, full rotary, neox)
+    pytest.param(32, 16, 256, 256, True, id="gemma4_sliding"),
+    # Gemma4 full-attention layers (global_head_dim 512, full rotary, neox)
+    pytest.param(32, 4, 512, 512, True, id="gemma4_full"),
 ]
 
 
@@ -631,6 +646,8 @@ _FUSION_CONFIGS = [
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
 @pytest.mark.parametrize("rms_norm_eps", [1e-6])
 @pytest.mark.parametrize("custom_op", ["+rotary_embedding", "+rms_norm"])
+# Gemma4 applies a weightless V-norm on every attention layer; cover both.
+@pytest.mark.parametrize("has_v_norm", [False, True])
 # The fused_qk_norm_rope_cache kernel used by this test aborts on AITER < 0.1.20
 # (fused_qk_norm_rope_cache_quant.cu: "k_cache/v_cache must be contiguous within
 # a block")
@@ -657,6 +674,7 @@ def test_qk_norm_rope_kvcache_fusion(
     rms_norm_eps: float,
     custom_op: str,
     use_shuffle_kv_layout: str,
+    has_v_norm: bool,
     monkeypatch: pytest.MonkeyPatch,
 ):
     _run_qk_norm_rope_kvcache_fusion_test(
@@ -675,6 +693,7 @@ def test_qk_norm_rope_kvcache_fusion(
         kv_cache_dtype=kv_cache_dtype,
         rms_norm_eps=rms_norm_eps,
         custom_op=custom_op,
+        has_v_norm=has_v_norm,
         monkeypatch=monkeypatch,
     )
 
