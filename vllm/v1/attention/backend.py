@@ -107,6 +107,11 @@ class AttentionBackend(ABC):
         return (not supported_head_sizes) or head_size in supported_head_sizes
 
     @classmethod
+    def supports_head_size_v(cls, head_size: int, head_size_v: int) -> bool:
+        """Whether the backend can serve a V head size that differs from K's."""
+        return head_size_v == head_size
+
+    @classmethod
     def supports_dtype(cls, dtype: torch.dtype) -> bool:
         return dtype in cls.supported_dtypes
 
@@ -992,11 +997,15 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         is_neox: bool,
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
+        v_norm: bool = False,
     ):
         """If `fused_qk_norm_rope_kvcache_supported` returns True, this method
         will be called by the fused custom op. Applies QK-norm + RoPE and
         writes K/V to the KV cache. Results are written to the pre-allocated
         q_out and k_out tensors; V is split from QKV at the graph level.
+
+        When v_norm is True, a weightless RMS norm is applied to V before the
+        KV-cache write (e.g. Gemma4's has_weight=false v_norm).
         """
         raise NotImplementedError
 
@@ -1031,10 +1040,14 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         is_neox: bool,
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
+        query_out: torch.Tensor | None = None,
+        key_out: torch.Tensor | None = None,
     ):
         """If `fused_rope_kvcache_supported` returns True, this method will be called
         by torch.ops.vllm.fused_rope_and_unified_kv_cache_update
-        to perform the inplace RoPE and KV cache update.
+        to perform the RoPE and KV cache update. The rotated q/k go to
+        `query_out`/`key_out` when given, else RoPE is applied in place. Overrides
+        without these arguments still work: the caller passes them copies.
         """
         raise NotImplementedError
 
@@ -1044,6 +1057,9 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
 
     hisparse_cache: "HiSparseCacheHandle | None" = None
     supports_pcp: bool = True
+
+    def get_fp8_ds_mla_row_bytes(self) -> int:
+        return 656
 
     @abstractmethod
     def __init__(

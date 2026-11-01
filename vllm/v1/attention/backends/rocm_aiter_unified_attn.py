@@ -88,6 +88,12 @@ class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
         return head_size >= 32
 
     @classmethod
+    def supports_head_size_v(cls, head_size: int, head_size_v: int) -> bool:
+        # The cache is split with `split(head_size)` over a 2*head_size page, so
+        # V can be narrower than K but not wider.
+        return head_size_v <= head_size
+
+    @classmethod
     def supports_mm_prefix(cls) -> bool:
         # Not implemented
         return False
@@ -432,6 +438,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         is_neox: bool,
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
+        v_norm: bool = False,
     ):
         key_cache, value_cache = self._split_kv_cache(kv_cache)
         rocm_aiter_ops.do_qk_norm_rope_kvcache_update(
@@ -455,6 +462,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             kv_cache_dtype=self.kv_cache_dtype,
             use_shuffle_layout=self._use_shuffle_kv,
             return_kv=False,
+            v_norm=v_norm,
         )
 
     def do_qk_norm_mrope_kvcache_update(
@@ -509,8 +517,13 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         is_neox: bool,
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
+        query_out: torch.Tensor | None = None,
+        key_out: torch.Tensor | None = None,
     ):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            if query_out is not None and key_out is not None:
+                query_out.copy_(query)
+                key_out.copy_(key)
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
             return
@@ -539,4 +552,6 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             layer._v_scale,
             flash_layout,
             is_fp8_kv_cache,
+            query_out=query_out,
+            key_out=key_out,
         )

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 import os
 from importlib.metadata import version
 
@@ -21,7 +22,7 @@ from vllm._aiter_ops import (
     is_aiter_found_and_supported,
     rocm_aiter_ops,
 )
-from vllm.compilation.passes.fusion.matcher_utils import MROPE_OP, ROTARY_OP
+from vllm.compilation.passes.fusion.matcher_utils import MROPE_OP
 from vllm.compilation.passes.fusion.qk_norm_rope_kvcache_fusion import (
     QkNormRopeKvCacheFusionPass,
 )
@@ -64,7 +65,6 @@ if not is_aiter_found_and_supported():
         allow_module_level=True,
     )
 
-INDEX_SELECT_OP = torch.ops.aten.index.Tensor
 FP8_DTYPE = current_platform.fp8_dtype()
 
 
@@ -103,6 +103,7 @@ class QKNormRoPEKVCacheTestModel(torch.nn.Module):
         dtype: torch.dtype,
         device: torch.device,
         rotary_dim: int | None = None,
+        has_v_norm: bool = False,
         prefix: str = "model.layers.0.self_attn.attn",
         expected_query_quant_group_shape: GroupShape | None = None,
     ):
@@ -118,9 +119,16 @@ class QKNormRoPEKVCacheTestModel(torch.nn.Module):
         self.dtype = dtype
         self.device = device
         self.layer_name = prefix
+        self.has_v_norm = has_v_norm
 
         self.q_norm = RMSNorm(head_size, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_size, eps=rms_norm_eps)
+        # Gemma4 applies a weightless V-norm on every attention layer.
+        self.v_norm = (
+            RMSNorm(head_size, eps=rms_norm_eps, has_weight=False)
+            if has_v_norm
+            else None
+        )
 
         self.rotary_emb = RotaryEmbedding(
             head_size,
@@ -130,8 +138,6 @@ class QKNormRoPEKVCacheTestModel(torch.nn.Module):
             is_neox_style=is_neox,
             dtype=self.dtype,
         )
-
-        self.enable_rope_custom_op = self.rotary_emb.enabled()
 
         self.attn = Attention(
             num_heads=num_heads,
@@ -255,22 +261,15 @@ class QKNormRoPEKVCacheTestModel(torch.nn.Module):
         q = q.view(-1, self.num_heads, self.head_size)
         k = k.view(-1, self.num_kv_heads, self.head_size)
         v = v.view(-1, self.num_kv_heads, self.head_size)
+        if self.v_norm is not None:
+            v = self.v_norm(v)
         kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
             k, v, _encode_layer_name(self.layer_name)
         )
         return q, k, v, kv_cache_dummy_dep
 
     def ops_in_model_before(self) -> list[torch._ops.OpOverload]:
-        ops: list[torch._ops.OpOverload] = []
-        # RoPE is not yet IR-migrated, so its custom op still surfaces
-        # directly in the graph based on `enable_rope_custom_op`.
-        if self.enable_rope_custom_op:
-            if rocm_aiter_ops.is_triton_rotary_embed_enabled():
-                ops.append(torch.ops.vllm.rocm_aiter_triton_rotary_embedding.default)
-            else:
-                ops.append(ROTARY_OP)
-        else:
-            ops.append(INDEX_SELECT_OP)
+        ops = [torch.ops.vllm_ir.rotary_embedding.default]
         ops.append(torch.ops.vllm.unified_kv_cache_update.default)
         return ops
 
@@ -297,7 +296,6 @@ class QKNormMRoPEKVCacheTestModel(QKNormRoPEKVCacheTestModel):
             mrope_section=list(mrope_section),
             mrope_interleaved=mrope_interleaved,
         )
-        self.enable_rope_custom_op = self.rotary_emb.enabled()
 
     def forward(
         self, qkv: torch.Tensor, positions: torch.Tensor
@@ -353,6 +351,7 @@ def _run_qk_norm_rope_kvcache_fusion_test(
     kv_cache_dtype: CacheDType,
     rms_norm_eps: float,
     custom_op: str,
+    has_v_norm: bool,
     monkeypatch: pytest.MonkeyPatch,
     mrope_section: tuple[int, int, int] | None = None,
     mrope_interleaved: bool = False,
@@ -391,7 +390,11 @@ def _run_qk_norm_rope_kvcache_fusion_test(
         ),
     )
 
-    with vllm.config.set_current_vllm_config(vllm_config), monkeypatch.context() as m:
+    with (
+        vllm.config.set_current_vllm_config(vllm_config),
+        monkeypatch.context() as m,
+        contextlib.ExitStack() as stack,
+    ):
         m.setenv("VLLM_ROCM_USE_AITER", "1")
         m.setenv("VLLM_ROCM_USE_AITER_LINEAR", "1")
         m.setenv(
@@ -400,6 +403,10 @@ def _run_qk_norm_rope_kvcache_fusion_test(
         )
         m.setenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", use_shuffle_kv_layout)
         rocm_aiter_ops.refresh_env_variables()
+        # Unfused reference uses the same RoPE kernel as a real run.
+        stack.enter_context(
+            current_platform.get_default_ir_op_priority(vllm_config).set_priority()
+        )
 
         expected_query_quant_group_shape = None
         if use_quark_scalar_query_scale:
@@ -423,7 +430,7 @@ def _run_qk_norm_rope_kvcache_fusion_test(
             "expected_query_quant_group_shape": expected_query_quant_group_shape,
         }
         if mrope_section is None:
-            model = QKNormRoPEKVCacheTestModel(**model_kwargs)
+            model = QKNormRoPEKVCacheTestModel(**model_kwargs, has_v_norm=has_v_norm)
         else:
             alternate_section = (8, 8, 8)
             m.setattr(
@@ -571,6 +578,10 @@ _FUSION_CONFIGS = [
     pytest.param(32, 2, 128, 64, False, id="glm4_dense"),
     # Moondream3-style small head (head_size=64, rotary_dim=32)
     pytest.param(16, 2, 64, 32, True, id="partial_small_head"),
+    # Gemma4 sliding-attention layers (head_dim 256, full rotary, neox)
+    pytest.param(32, 16, 256, 256, True, id="gemma4_sliding"),
+    # Gemma4 full-attention layers (global_head_dim 512, full rotary, neox)
+    pytest.param(32, 4, 512, 512, True, id="gemma4_full"),
 ]
 
 
@@ -631,6 +642,8 @@ _FUSION_CONFIGS = [
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
 @pytest.mark.parametrize("rms_norm_eps", [1e-6])
 @pytest.mark.parametrize("custom_op", ["+rotary_embedding", "+rms_norm"])
+# Gemma4 applies a weightless V-norm on every attention layer; cover both.
+@pytest.mark.parametrize("has_v_norm", [False, True])
 # The fused_qk_norm_rope_cache kernel used by this test aborts on AITER < 0.1.20
 # (fused_qk_norm_rope_cache_quant.cu: "k_cache/v_cache must be contiguous within
 # a block")
@@ -657,6 +670,7 @@ def test_qk_norm_rope_kvcache_fusion(
     rms_norm_eps: float,
     custom_op: str,
     use_shuffle_kv_layout: str,
+    has_v_norm: bool,
     monkeypatch: pytest.MonkeyPatch,
 ):
     _run_qk_norm_rope_kvcache_fusion_test(
@@ -675,6 +689,7 @@ def test_qk_norm_rope_kvcache_fusion(
         kv_cache_dtype=kv_cache_dtype,
         rms_norm_eps=rms_norm_eps,
         custom_op=custom_op,
+        has_v_norm=has_v_norm,
         monkeypatch=monkeypatch,
     )
 
@@ -696,6 +711,14 @@ def test_qk_norm_rope_kvcache_fusion(
         pytest.param(KVCacheLayout.LHBNC, id="block_major"),
     ],
 )
+@pytest.mark.parametrize(
+    "custom_op",
+    [
+        "+rotary_embedding",
+        # MRoPE fusion must not depend on the user enabling the RoPE custom op.
+        "+rms_norm",
+    ],
+)
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
 @pytest.mark.skipif(
     not IS_AITER_FOUND,
@@ -707,6 +730,7 @@ def test_qk_norm_mrope_kvcache_fusion(
     is_neox: bool,
     kv_layout: KVCacheLayout,
     kv_cache_dtype: CacheDType,
+    custom_op: str,
     monkeypatch: pytest.MonkeyPatch,
 ):
     _run_qk_norm_rope_kvcache_fusion_test(
@@ -724,7 +748,7 @@ def test_qk_norm_mrope_kvcache_fusion(
         dtype=torch.bfloat16,
         kv_cache_dtype=kv_cache_dtype,
         rms_norm_eps=1e-6,
-        custom_op="+rotary_embedding",
+        custom_op=custom_op,
         monkeypatch=monkeypatch,
         mrope_section=mrope_section,
         mrope_interleaved=mrope_interleaved,
