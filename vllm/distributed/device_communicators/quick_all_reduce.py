@@ -43,6 +43,22 @@ KB = 1024
 MB = 1024 * KB
 
 
+class _FlyQuickAllReduceAdapter:
+    """The aiter#5670 plain backend behind the QuickAllReduceInt4 calls."""
+
+    def __init__(self, fly_ar: Any) -> None:
+        self._ar = fly_ar
+
+    def accepts(self, inp: torch.Tensor) -> bool:
+        return self._ar.should_fly_ar(inp)
+
+    def allreduce(self, inp: torch.Tensor, out: torch.Tensor) -> None:
+        self._ar.fly_ar(inp, out=out)
+
+    def close(self) -> None:
+        self._ar.close()
+
+
 class QuickAllReduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
@@ -91,6 +107,8 @@ class QuickAllReduce:
         """
         self.disabled = True
         self._flydsl_int4: Any = None
+        # aiter#5670 fused all-reduce + RMSNorm (quantized), or None.
+        self._flydsl_rms: Any = None
         if not self._rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -268,6 +286,20 @@ class QuickAllReduce:
             or not rocm_aiter_ops.is_flydsl_quick_reduce_available()
         ):
             return None
+        try:
+            # ROCm/aiter#5670 moved the FlyDSL INT4 all-reduce behind backend
+            # classes (mesh/ring picked by a per-link policy) and added a fused
+            # all-reduce + RMSNorm on the same wire format.
+            from aiter.dist.device_communicators.flydsl_backends import (
+                FlyDSLAllReduceRMSNorm,
+                FlyDSLQuickAllReduce,
+            )
+        except ImportError:
+            pass
+        else:
+            return self._init_flydsl_backends(
+                vllm_config, FlyDSLQuickAllReduce, FlyDSLAllReduceRMSNorm
+            )
         flydsl_int4 = rocm_aiter_ops.create_flydsl_quick_all_reduce_int4(
             group=self.group,
             device=self.device,
@@ -277,7 +309,14 @@ class QuickAllReduce:
         # compile() runs a real all-reduce on every rank. It moves the JIT
         # out of the first prefill and out of CUDA graph capture.
         warmup = torch.empty(MB, dtype=torch.bfloat16, device=self.device)
-        flydsl_int4.compile(warmup, torch.empty_like(warmup))
+        if hasattr(flydsl_int4, "compile"):
+            flydsl_int4.compile(warmup, torch.empty_like(warmup))
+        else:
+            # ROCm/aiter#5461 (PCIe ring/mesh INT4) replaced compile() with
+            # preload(); one real all-reduce keeps the JIT out of the first
+            # prefill as before.
+            flydsl_int4.preload()
+            flydsl_int4.allreduce(warmup, torch.empty_like(warmup))
         torch.accelerator.synchronize(self.device)
         logger.info(
             "Using AITER FlyDSL INT4 QuickReduce for BF16 payloads; other "
@@ -293,6 +332,34 @@ class QuickAllReduce:
                 "separate RMSNorm, so the fusion does nothing for them."
             )
         return flydsl_int4
+
+    def _init_flydsl_backends(self, vllm_config, plain_cls, fused_cls) -> Any:
+        """aiter#5670 backends. Construction is collective (every rank votes on
+        its plan and builds or declines with its peers), and every binary is
+        compiled here, before any graph capture."""
+        fly_ar = plain_cls(self.group, self.device, quantization="INT4")
+        if fly_ar.disabled:
+            fly_ar.close()
+            fly_ar = None
+        hiddens: tuple[int, ...] = ()
+        if vllm_config is not None and vllm_config.model_config is not None:
+            hiddens = (vllm_config.model_config.get_hidden_size(),)
+        rms = fused_cls(self.group, self.device, quantized=True, hiddens=hiddens)
+        if rms.disabled:
+            rms.close()
+        else:
+            self._flydsl_rms = rms
+            logger.info(
+                "Using AITER FlyDSL INT4 fused all-reduce + RMSNorm for hidden %s.",
+                hiddens,
+            )
+        if fly_ar is None:
+            return None
+        logger.info(
+            "Using AITER FlyDSL INT4 QuickReduce backends for BF16 payloads in "
+            "their policy window; other payloads use the HIP QuickReduce kernels."
+        )
+        return _FlyQuickAllReduceAdapter(fly_ar)
 
     @staticmethod
     def _get_qr_min_size(qr_max_size: int | None) -> int | None:
@@ -390,6 +457,10 @@ class QuickAllReduce:
             and inp.is_contiguous()
             and inp.data_ptr() % 16 == 0
             and self._get_qr_quant_level(inp) == QuickReduceRegime.INT4.value
+            and (
+                not isinstance(self._flydsl_int4, _FlyQuickAllReduceAdapter)
+                or self._flydsl_int4.accepts(inp)
+            )
         )
 
     def uses_flydsl_int4(self, inp: torch.Tensor) -> bool:
@@ -409,6 +480,9 @@ class QuickAllReduce:
         if self._flydsl_int4 is not None:
             self._flydsl_int4.close()
             self._flydsl_int4 = None
+        if self._flydsl_rms is not None:
+            self._flydsl_rms.close()
+            self._flydsl_rms = None
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)

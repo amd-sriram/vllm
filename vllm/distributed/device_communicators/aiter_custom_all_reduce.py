@@ -8,6 +8,8 @@ the fused allreduce+RMSNorm path share a single AITER instance with its IPC buff
 
 """
 
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -17,8 +19,15 @@ logger = init_logger(__name__)
 
 
 class AiterCustomAllreduce:
-    # Default IPC buffer size for AITER's CustomAllreduce.
-    MAX_SIZE: int = 8192 * 1024 * 8 * 2
+    # Default IPC buffer size for AITER's CustomAllreduce. The allreduce-RMSNorm
+    # fusion pass only covers token counts whose payload fits in half of it
+    # (64 MiB: 11,915 tokens at hidden 2816), so a 16k-token prefill chunk
+    # runs unfused; VLLM_ROCM_AITER_CUSTOM_AR_MAX_SIZE_MB raises the cap.
+    MAX_SIZE: int = (
+        int(os.environ["VLLM_ROCM_AITER_CUSTOM_AR_MAX_SIZE_MB"]) * 1024 * 1024
+        if os.environ.get("VLLM_ROCM_AITER_CUSTOM_AR_MAX_SIZE_MB")
+        else 8192 * 1024 * 8 * 2
+    )
 
     @classmethod
     def effective_max_size(cls) -> int:

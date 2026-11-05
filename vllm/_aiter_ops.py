@@ -1200,6 +1200,24 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     assert aiter_ar is not None, "aiter allreduce must be initialized"
     ca = aiter_ar.aiter_ca
+
+    if not gemma_norm:
+        # ROCm/aiter#5670 FlyDSL fused all-reduce + RMSNorm: the quantized
+        # (INT4 mesh/ring) build first, then the exact one-shot. Both decide
+        # from shapes only, so every rank takes the same branch.
+        from vllm.distributed import get_tp_group
+
+        qr_comm = getattr(get_tp_group().device_communicator, "qr_comm", None)
+        fly_rms = getattr(qr_comm, "_flydsl_rms", None)
+        if fly_rms is not None and fly_rms.should_fly_fused_ar_rms(
+            input_, residual, weight
+        ):
+            return fly_rms.fly_fused_ar_rms(input_, residual, weight, epsilon)
+        if getattr(ca, "should_fly_allreduce_rmsnorm", None) is not None and (
+            ca.should_fly_allreduce_rmsnorm(input_, residual, weight)
+        ):
+            return ca.fly_allreduce_rmsnorm(input_, residual, weight, epsilon)
+
     use_1stage = aiter_ar.use_1stage_fused_ar_rms(input_)
 
     if not use_1stage:
