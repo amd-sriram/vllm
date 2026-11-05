@@ -2508,6 +2508,142 @@ class rocm_aiter_ops:
     def is_shuffle_kv_cache_enabled(cls) -> bool:
         return cls._SHUFFLE_KV_CACHE_ENABLED
 
+    @staticmethod
+    @functools.cache
+    def flydsl_pa_decode_available() -> bool:
+        """Whether AITER exports the FlyDSL NHD paged-attention decode.
+
+        Added in https://github.com/ROCm/aiter/pull/5949; gfx950 only. Older
+        AITER builds ship pa_decode for the 5D shuffled layout only.
+        """
+        from vllm.platforms.rocm import on_gfx950
+
+        if not on_gfx950():
+            return False
+        try:
+            import aiter.ops.flydsl as flydsl
+        except ImportError:
+            return False
+        return all(
+            hasattr(flydsl, name)
+            for name in (
+                "pa_decode",
+                "plan_pa_decode",
+                "pa_decode_nhd_max_query_length",
+                "pa_decode_default_workgroup_budget",
+            )
+        )
+
+    @staticmethod
+    def flydsl_pa_decode_max_query_len(
+        kv_dtype: torch.dtype, head_size: int, block_size: int, num_queries_per_kv: int
+    ) -> int:
+        """Longest uniform query flydsl_pa_decode takes for this layer shape,
+        or 0 if it can't serve the layer."""
+        from aiter.ops.flydsl import pa_decode_nhd_max_query_length
+
+        return pa_decode_nhd_max_query_length(
+            torch.device("cuda"),
+            kv_dtype=kv_dtype,
+            head_dim=head_size,
+            block_size=block_size,
+            query_group_size=num_queries_per_kv,
+        )
+
+    @staticmethod
+    def flydsl_pa_decode_plan(
+        seq_lens: torch.Tensor,
+        num_kv_heads: int,
+        *,
+        kv_dtype: torch.dtype,
+        head_size: int,
+        block_size: int,
+        num_queries_per_kv: int,
+        sliding_window: int = 0,
+        plan: Any | None = None,
+    ) -> Any:
+        """Build or refresh the GPU work plan for flydsl_pa_decode().
+
+        The plan depends only on the context lengths and the window, so one
+        plan serves every layer of a KV cache group. Passing the previous plan
+        refreshes its buffers in place with a GPU kernel (no host readback),
+        so a CUDA graph that captured the decode keeps reading them. Allocate
+        new plans outside graph capture.
+        """
+        from aiter.ops.flydsl import (
+            pa_decode_default_workgroup_budget,
+            plan_pa_decode,
+        )
+
+        if plan is not None:
+            return plan_pa_decode(
+                seq_lens, num_kv_heads, sliding_window=sliding_window, plan=plan
+            )
+        budget = pa_decode_default_workgroup_budget(
+            seq_lens.device,
+            kv_dtype=kv_dtype,
+            head_dim=head_size,
+            block_size=block_size,
+            query_length=1,
+            query_group_size=num_queries_per_kv,
+            sliding_window=sliding_window,
+        )
+        return plan_pa_decode(
+            seq_lens,
+            num_kv_heads,
+            workgroup_budget=budget,
+            sliding_window=sliding_window,
+        )
+
+    @staticmethod
+    def flydsl_pa_decode(
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        scale: float,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        work_plan: Any,
+        sliding_window: int = 0,
+    ) -> None:
+        """Single-token FP8 paged-attention decode on NHD K/V views.
+
+        Args:
+            output: [num_seqs, num_heads, head_size], written in place.
+            query: [num_seqs, num_heads, head_size], BF16/FP16.
+            key_cache: [num_blocks, block_size, num_kv_heads, head_size] FP8.
+            value_cache: FP8 view shaped like key_cache.
+            seq_lens: [num_seqs] int32 context lengths, including the query.
+            block_table: [num_seqs, max_num_blocks] int32.
+            scale: Softmax scale.
+            k_scale: Per-tensor K dequantization scale.
+            v_scale: Per-tensor V dequantization scale.
+            work_plan: Plan from flydsl_pa_decode_plan() for these seq_lens
+                and this sliding_window.
+            sliding_window: Keys each query attends to, its own included;
+                0 for full attention.
+        """
+        from aiter.ops.flydsl import pa_decode
+
+        pa_decode(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            seq_lens,
+            block_table,
+            scale,
+            query_length=1,
+            compute_type=key_cache.dtype,
+            key_scale=k_scale,
+            value_scale=v_scale,
+            sliding_window=sliding_window,
+            work_plan=work_plan,
+        )
+
     @classmethod
     @if_aiter_supported
     def fused_qknorm_idxrqknorm_enabled(
@@ -4033,6 +4169,7 @@ class rocm_aiter_ops:
         block_size: int,
         x: int,
         rotary_dim: int = 0,
+        v_norm: bool = False,
     ):
         from aiter.ops.fused_qk_norm_rope_cache_quant import (
             fused_qk_norm_rope_cache_pts_quant_shuffle,
@@ -4064,6 +4201,7 @@ class rocm_aiter_ops:
             block_size,
             x,
             rotary_dim,
+            v_norm,
         )
 
     @staticmethod
@@ -4088,6 +4226,7 @@ class rocm_aiter_ops:
         kv_cache_dtype: str,
         use_shuffle_layout: bool,
         return_kv: bool,
+        v_norm: bool = False,
     ) -> None:
         """Run the fused QK-norm+RoPE+KV-cache op on already-split k/v caches.
 
@@ -4139,6 +4278,7 @@ class rocm_aiter_ops:
             block_size=key_cache.shape[1],
             x=16 // key_cache.element_size(),
             rotary_dim=kernel_rotary_dim,
+            v_norm=v_norm,
         )
         if dequant_k_out:
             ops.convert_fp8(k_out, kernel_k_out, float(k_scale), kv_cache_dtype)

@@ -2,19 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with PagedAttention and Triton prefix prefill."""
 
-from typing import ClassVar
+from dataclasses import dataclass, fields
+from typing import Any, ClassVar
 
 import torch
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import IS_AITER_FOUND, rocm_aiter_ops
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import (
+    VllmConfig,
+    get_current_vllm_config_or_none,
+    get_layers_from_vllm_config,
+)
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8StaticTensorSym,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx1250
 from vllm.v1.attention.backend import (
     AttentionLayer,
@@ -48,7 +55,83 @@ def _kv_connector_enabled() -> bool:
     return kv_transfer_config is not None and kv_transfer_config.is_kv_transfer_instance
 
 
+# KV cache page size of the NHD views the FlyDSL decode reads.
+FLYDSL_PA_DECODE_BLOCK_SIZE = 64
+
+
+@dataclass
+class RocmAiterUnifiedAttentionMetadata(RocmAttentionMetadata):
+    # FlyDSL decode work plan, set when every request in the batch decodes one
+    # token and every layer of this KV cache group can take the FlyDSL decode.
+    flydsl_plan: Any | None = None
+
+
 class RocmAiterUnifiedAttentionMetadataBuilder(RocmAttentionMetadataBuilder):
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # The FlyDSL decode needs one plan per (batch size, window), and the
+        # window is a property of the layer, so only groups whose layers all
+        # take it, with one window between them, plan for it. A captured CUDA
+        # graph keeps reading the buffers of its batch size's plan, which
+        # build() refreshes in place every step.
+        self.use_flydsl_pa_decode = False
+        self._flydsl_plans: dict[int, Any] = {}
+        if kv_cache_spec.block_size != FLYDSL_PA_DECODE_BLOCK_SIZE:
+            return
+        layers = get_layers_from_vllm_config(vllm_config, Attention, layer_names)
+        impls = [layer.impl for layer in layers.values()]
+        if not impls or not all(
+            getattr(impl, "use_flydsl_pa_decode", False) for impl in impls
+        ):
+            return
+        windows = {impl.flydsl_sliding_window for impl in impls}
+        if len(windows) != 1:
+            return
+        self._flydsl_sliding_window = windows.pop()
+        self._flydsl_num_queries_per_kv = impls[0].num_queries_per_kv
+        self.use_flydsl_pa_decode = True
+
+    def _flydsl_plan(self, seq_lens: torch.Tensor, num_reqs: int) -> Any:
+        plan = rocm_aiter_ops.flydsl_pa_decode_plan(
+            seq_lens[:num_reqs],
+            self.kv_cache_spec.num_kv_heads,
+            kv_dtype=current_platform.fp8_dtype(),
+            head_size=self.kv_cache_spec.head_size,
+            block_size=FLYDSL_PA_DECODE_BLOCK_SIZE,
+            num_queries_per_kv=self._flydsl_num_queries_per_kv,
+            sliding_window=self._flydsl_sliding_window,
+            plan=self._flydsl_plans.get(num_reqs),
+        )
+        self._flydsl_plans[num_reqs] = plan
+        return plan
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> RocmAiterUnifiedAttentionMetadata:
+        base = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        flydsl_plan = None
+        num_reqs = common_attn_metadata.num_reqs
+        if (
+            self.use_flydsl_pa_decode
+            and base.causal
+            and base.max_query_len == 1
+            and base.num_actual_tokens == num_reqs
+        ):
+            flydsl_plan = self._flydsl_plan(base.seq_lens, num_reqs)
+        return RocmAiterUnifiedAttentionMetadata(
+            **{f.name: getattr(base, f.name) for f in fields(base)},
+            flydsl_plan=flydsl_plan,
+        )
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> RocmAttentionMetadata:
@@ -209,6 +292,44 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             self._shuffle_kv_layout and self.attn_type != AttentionType.ENCODER_DECODER
         )
 
+        self.use_flydsl_pa_decode = self._supports_flydsl_pa_decode()
+        # Keys a decode query attends to, its own included; 0 = no window.
+        self.flydsl_sliding_window = (
+            self.sliding_window[0] + 1 if self.sliding_window[0] >= 0 else 0
+        )
+        if self.use_flydsl_pa_decode:
+            # The FlyDSL decode reads BF16 queries, so the query stays
+            # unquantized on these layers; prefill uses the BF16-Q / FP8-KV
+            # unified attention kernel.
+            self.supports_quant_query_input = False
+
+    def _supports_flydsl_pa_decode(self) -> bool:
+        """Whether single-token decodes on this layer can run AITER's FlyDSL
+        paged-attention decode (gfx950, FP8 KV, head 256, 64-token pages).
+
+        Sliding windows are supported; the decode takes the window from the
+        work plan the metadata builder refreshes each step.
+        """
+        if (
+            self.attn_type != AttentionType.DECODER
+            or self.kv_cache_dtype not in ("fp8", "fp8_e4m3")
+            or self.alibi_slopes is not None
+            or self.logits_soft_cap
+            or self.sinks is not None
+            or self._shuffle_kv_layout
+            or not rocm_aiter_ops.flydsl_pa_decode_available()
+        ):
+            return False
+        return (
+            rocm_aiter_ops.flydsl_pa_decode_max_query_len(
+                current_platform.fp8_dtype(),
+                self.head_size,
+                FLYDSL_PA_DECODE_BLOCK_SIZE,
+                self.num_queries_per_kv,
+            )
+            > 0
+        )
+
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -301,6 +422,28 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
 
         if self._use_shuffle_kv:
             key_cache, value_cache = self._shuffle_kv_views(key_cache, value_cache)
+
+        flydsl_plan = getattr(attn_metadata, "flydsl_plan", None)
+        if (
+            flydsl_plan is not None
+            and self.use_flydsl_pa_decode
+            and output_scale is None
+            and key_cache.shape[1] == FLYDSL_PA_DECODE_BLOCK_SIZE
+        ):
+            rocm_aiter_ops.flydsl_pa_decode(
+                output=output[:num_actual_tokens],
+                query=query[:num_actual_tokens],
+                key_cache=key_cache,
+                value_cache=value_cache,
+                seq_lens=attn_metadata.seq_lens[:num_actual_tokens],
+                block_table=attn_metadata.block_table[:num_actual_tokens],
+                scale=softmax_scale,
+                k_scale=layer._k_scale,
+                v_scale=layer._v_scale,
+                work_plan=flydsl_plan,
+                sliding_window=self.flydsl_sliding_window,
+            )
+            return output
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
@@ -440,6 +583,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         is_neox: bool,
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
+        v_norm: bool = False,
     ):
         key_cache, value_cache = self._split_kv_cache(kv_cache)
         rocm_aiter_ops.do_qk_norm_rope_kvcache_update(
@@ -463,6 +607,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             kv_cache_dtype=self.kv_cache_dtype,
             use_shuffle_layout=self._use_shuffle_kv,
             return_kv=False,
+            v_norm=v_norm,
         )
 
     def do_qk_norm_mrope_kvcache_update(
