@@ -1618,6 +1618,7 @@ def rocm_aiter_sparse_attn_indexer(
                 decode_metadata.seq_lens.reshape(-1),
                 topk_indices,
                 topk_tokens,
+                max_row_len=max_compressed_seq_len,
             )
         else:
             torch.ops._C.top_k_per_row_decode(

@@ -46,6 +46,15 @@ def _is_fp8_e4m3_tensor(t: torch.Tensor | None) -> bool:
     return t is not None and t.dtype in _FP8_E4M3_DTYPES
 
 
+@functools.cache
+def _aiter_decode_top_k_takes_max_row_len() -> bool:
+    import inspect
+
+    from aiter.ops.topk import top_k_per_row_decode
+
+    return "max_row_len" in inspect.signature(top_k_per_row_decode).parameters
+
+
 def _get_or_create_aiter_qr_rmsnorm_comm(
     device_comm: Any,
 ) -> tuple[int, int, bool] | None:
@@ -3021,9 +3030,16 @@ class rocm_aiter_ops:
         seq_lens: torch.Tensor,
         topk_indices: torch.Tensor,
         topk_tokens: int,
+        max_row_len: int | None = None,
     ) -> None:
         from aiter.ops.topk import top_k_per_row_decode
 
+        # AITER's adaptive decode top-k (ROCm/aiter#5677) is opt-in: it only
+        # runs when the caller bounds the live row length. Older AITER has no
+        # such argument.
+        extra = {}
+        if max_row_len is not None and _aiter_decode_top_k_takes_max_row_len():
+            extra["max_row_len"] = max_row_len
         top_k_per_row_decode(
             logits,
             next_n,
@@ -3033,6 +3049,7 @@ class rocm_aiter_ops:
             logits.stride(0),
             logits.stride(1),
             k=topk_tokens,
+            **extra,
         )
 
     @staticmethod
