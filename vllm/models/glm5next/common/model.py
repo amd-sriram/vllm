@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 import torch
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -24,7 +25,6 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.utils import (
-    is_model_fused_shared_expert_compatible,
     resolve_layer_fused_shared_expert,
 )
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
@@ -76,6 +76,8 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    extract_layer_index,
+    get_fused_shared_expert_layers,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_layers,
@@ -110,6 +112,18 @@ def get_sparse_topk_buffer_width(config: Glm5NextTextConfig) -> int:
     kpool = config.index_kpool
     assert kpool is not None
     return round_up(topk + kpool - 1, 128)
+
+
+def _specialized_decode_config(vllm_config: VllmConfig):
+    """The AMD specialized decode's config (None without ``--monokernel``); its
+    runtime is imported only when the switch is on."""
+    if not vllm_config.kernel_config.monokernel:
+        return None
+    from vllm.models.glm5next.amd.specialized_decode.runtime import (
+        specialized_decode_config,
+    )
+
+    return specialized_decode_config(vllm_config)
 
 
 _MHC_TAU = 0.05
@@ -749,8 +763,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         # The active slice is fixed after construction; cache it so forward
         # doesn't rebuild the slice (a fresh list) every step.
         self._active_layers = self.layers[self.start_layer : self.end_layer]
-        self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
-            self.layers, Glm5NextMoE, "mlp"
+        self.fused_shared_expert_layers = get_fused_shared_expert_layers(
+            self,
+            Glm5NextMoE,
+            enable_eplb=vllm_config.parallel_config.enable_eplb,
         )
 
         if get_pp_group().is_last_rank:
@@ -765,6 +781,22 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         world_size = get_tensor_model_parallel_world_size()
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
+        )
+        self.vllm_config = vllm_config
+        self.specialized_decode_config = _specialized_decode_config(vllm_config)
+        self.specialized_decode: Any = None
+
+    def build_specialized_decode(self) -> None:
+        """Called by ``Glm5NextModelState`` once the weights are loaded."""
+        from vllm.models.glm5next.amd.specialized_decode.runtime.decode import (
+            SpecializedDecode,
+        )
+
+        assert self.specialized_decode_config is not None
+        if self.specialized_decode is not None:
+            raise ValueError("--monokernel: reloading weights is not supported")
+        self.specialized_decode = SpecializedDecode(
+            self, self.specialized_decode_config
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -819,6 +851,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
+        decode = self.specialized_decode
+        step = None if decode is None else decode.plan(positions, intermediate_tensors)
         aux_hidden_states: list[torch.Tensor] = []
         for idx, layer in enumerate(self._active_layers, start=self.start_layer):
             if idx in self.aux_hidden_state_layers:
@@ -828,7 +862,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 if self.is_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
-            hidden_states, residual, post, comb = layer(
+            kernel = step.layer(idx) if step is not None else None
+            hidden_states, residual, post, comb = (kernel or layer)(
                 positions, hidden_states, residual, post, comb
             )
 
@@ -894,13 +929,15 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 0,
             )
             num_fused_shared = _num_fused_shared_experts(
-                self.config.n_shared_experts, self.is_fused_shared_expert_enabled
+                self.config.n_shared_experts,
+                bool(self.fused_shared_expert_layers),
             )
             expert_params_mapping = fused_moe_make_expert_params_mapping(
                 self,
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
+                # NOTE: global despite per-layer FSE; non-fused layers skip the extras.
                 num_experts=self.config.n_routed_experts + num_fused_shared,
                 num_redundant_experts=num_redundant_experts,
             )
@@ -930,7 +967,12 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if self.is_fused_shared_expert_enabled:
+            # Only parse the layer index when FSE is enabled.
+            if (
+                "mlp.shared_experts." in name
+                and bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
+                and extract_layer_index(name) in self.fused_shared_expert_layers
+            ):
                 name = _fused_shared_expert_name(name, self.config.n_routed_experts)
 
             # Handle FP8 indexer WK: dequantize to BF16 for fusion with
@@ -1133,8 +1175,21 @@ class Glm5NextForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        if self.model.specialized_decode is not None:
+            self.model.specialized_decode.after_step()
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def get_model_state_cls(self) -> type:
+        if self.model.specialized_decode_config is None:
+            from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+                MambaHybridModelState,
+            )
+
+            return MambaHybridModelState
+        from vllm.models.glm5next.amd.model_state import Glm5NextModelState
+
+        return Glm5NextModelState
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
@@ -1239,6 +1294,9 @@ class Glm5NextForConditionalGeneration(
         # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
         # so pipeline parallelism is gated off (consistent with the text-only
         # model) and we intentionally do not alias it here.
+
+    def get_model_state_cls(self) -> type:
+        return self.language_model.get_model_state_cls()
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
