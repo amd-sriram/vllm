@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -378,7 +379,14 @@ def aiter_moe_intermediate_alignment(intermediate: int) -> int:
     AITER dispatches on ``inter_dim <= 192``: below the threshold both stages
     use 64-wide tiles, above it at least one stage uses a 128-wide tile, and
     CK's ``IsSupportedArgument`` rejects a size not divisible by that width.
+
+    VLLM_ROCM_AITER_MOE_INTERMEDIATE_ALIGN overrides the width, for models whose
+    intermediate size is a multiple of 64 but not of 128 (Gemma 4 26B-A4B: 704,
+    padded to 768) when the AITER MoE table holds 64-wide kernels for that size.
     """
+    override = os.environ.get("VLLM_ROCM_AITER_MOE_INTERMEDIATE_ALIGN")
+    if override:
+        return int(override)
     return 64 if intermediate <= 192 else 128
 
 
