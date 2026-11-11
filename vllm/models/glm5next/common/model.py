@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import torch
 from torch import nn
@@ -98,6 +98,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 
+from ..nvidia.specialized_decode.runtime import specialized_decode_config
 from .attention import Glm5NextMLAAttention
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
@@ -105,6 +106,12 @@ from .multimodal import (
     Glm5NextProcessingInfo,
     Glm5NextVisionTransformer,
 )
+from .specialized_decode import requested
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
+
+    from ..nvidia.specialized_decode.runtime.decode import SpecializedDecode
 
 logger = init_logger(__name__)
 
@@ -116,6 +123,36 @@ def get_sparse_topk_buffer_width(config: Glm5NextTextConfig) -> int:
     kpool = config.index_kpool
     assert kpool is not None
     return round_up(topk + kpool - 1, 128)
+
+
+def _specialized_decode_config(vllm_config: VllmConfig):
+    """The ROCm specialized decode's config (the backbone's per-layer kernels), None
+    unless it is requested on ROCm. Off ROCm, `decode_backend=latency_specialized`
+    is the NVIDIA executor's (`Glm5NextForCausalLM`) and `--monokernel` is refused,
+    so a stock deployment never reaches AMD code. A ROCm GPU other than gfx950 is
+    refused by the runtime's own checks (`spec.refusal_reasons`)."""
+    if not requested(vllm_config):
+        return None
+    if not current_platform.is_rocm():
+        if vllm_config.kernel_config.monokernel:
+            raise ValueError(
+                "--monokernel runs GLM-5.3-Flash's specialized decode only on ROCm "
+                f"CDNA4 (gfx950); drop it on {current_platform.device_name}"
+            )
+        return None
+    from vllm.models.glm5next.amd.specialized_decode.runtime import (
+        specialized_decode_config,
+    )
+
+    return specialized_decode_config(vllm_config)
+
+
+def _executor_config(vllm_config: VllmConfig):
+    """The NVIDIA specialized decode executor's config, None on ROCm, where the
+    backbone serves the same switch with its own kernels."""
+    if current_platform.is_rocm():
+        return None
+    return specialized_decode_config(vllm_config)
 
 
 _MHC_TAU = 0.05
@@ -865,6 +902,22 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
+        self.vllm_config = vllm_config
+        self.specialized_decode_config = _specialized_decode_config(vllm_config)
+        self.specialized_decode: Any = None
+
+    def build_specialized_decode(self) -> None:
+        """Called by `Glm5NextModelState` once the weights are loaded."""
+        from vllm.models.glm5next.amd.specialized_decode.runtime.decode import (
+            SpecializedDecode,
+        )
+
+        assert self.specialized_decode_config is not None
+        if self.specialized_decode is not None:
+            raise ValueError("--monokernel: reloading weights is not supported")
+        self.specialized_decode = SpecializedDecode(
+            self, self.specialized_decode_config
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -878,10 +931,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
     ) -> torch.Tensor:
         """Completed residual stream entering a layer, as one hidden vector.
 
-        mHC layers defer their final ``hc_post`` into the next layer's fused
-        pre-op, so ``hidden_states`` holds the raw layer output while the
+        mHC layers defer their final `hc_post` into the next layer's fused
+        pre-op, so `hidden_states` holds the raw layer output while the
         widened stream is completed here and contracted back to
-        ``hidden_size``. Non-mHC layers already return the summed stream.
+        `hidden_size`. Non-mHC layers already return the summed stream.
         """
         if post is None:
             return hidden_states
@@ -918,6 +971,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
+        decode = self.specialized_decode
+        step = None if decode is None else decode.plan(positions, intermediate_tensors)
         aux_hidden_states: list[torch.Tensor] = []
         for idx, layer in enumerate(self._active_layers, start=self.start_layer):
             if idx in self.aux_hidden_state_layers:
@@ -927,7 +982,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 if self.is_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
-            hidden_states, residual, post, comb = layer(
+            kernel = step.layer(idx) if step is not None else None
+            hidden_states, residual, post, comb = (kernel or layer)(
                 positions, hidden_states, residual, post, comb
             )
 
@@ -1186,6 +1242,18 @@ class Glm5NextForCausalLM(
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=_LOGIT_SCALE
         )
+        # decode_backend=latency_specialized: a specialized decode executor over
+        # self.model, built by the model state once the weights are loaded.
+        self.specialized_decode_config = _executor_config(vllm_config)
+        self.specialized_decode: SpecializedDecode | None = None
+
+    def build_specialized_decode(self) -> None:
+        from ..nvidia.specialized_decode.runtime.decode import SpecializedDecode
+
+        self.specialized_decode = SpecializedDecode(
+            self.model, self.specialized_decode_config
+        )
+        self.specialized_decode.build_logits(self.logits_processor, self.lm_head)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1198,6 +1266,11 @@ class Glm5NextForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
+        decode = self.specialized_decode
+        if decode is not None:
+            step = decode.plan(positions, intermediate_tensors)
+            if step is not None:
+                return decode.run(step, input_ids, inputs_embeds)
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
@@ -1246,8 +1319,26 @@ class Glm5NextForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        if self.model.specialized_decode is not None:
+            self.model.specialized_decode.after_step()
+        decode = self.specialized_decode
+        if decode is not None:
+            logits = decode.compute_logits(
+                self.logits_processor, self.lm_head, hidden_states
+            )
+            if logits is not None:
+                return logits
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def get_model_state_cls(self) -> "type[ModelState]":
+        if self.model.specialized_decode_config is not None:
+            from ..amd.model_state import Glm5NextModelState as AmdModelState
+
+            return AmdModelState
+        from ..nvidia.model_state import Glm5NextModelState
+
+        return Glm5NextModelState
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
@@ -1358,8 +1449,25 @@ class Glm5NextForConditionalGeneration(
         # so pipeline parallelism is gated off (consistent with the text-only
         # model) and we intentionally do not alias it here.
 
-    def process_weights_after_loading(self) -> None:
-        self.language_model.process_weights_after_loading()
+    def get_model_state_cls(self) -> "type[ModelState]":
+        return self.language_model.get_model_state_cls()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | IntermediateTensors:
+        decode = self.language_model.specialized_decode
+        if decode is not None and intermediate_tensors is None:
+            step = decode.plan(positions, intermediate_tensors)
+            if step is not None:
+                return decode.run(step, input_ids, inputs_embeds)
+        return super().forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+        )
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
@@ -1422,15 +1530,15 @@ def get_spec_layer_idx_from_weight_name(
 def _fused_shared_experts_tuned(parallel_config: ParallelConfig) -> bool:
     """AITER has fused-MoE configs tuned for the fused shared-expert shape
     (one more expert and one more top-k slot than the routed MoE) only on
-    gfx950, with every expert on each rank and its weights split by TP4 or
-    TP8. Data, prefill context and expert parallelism change that split, so
+    gfx950, with every expert on each rank and its weights split by TP2, TP4
+    or TP8. Data, prefill context and expert parallelism change that split, so
     any other GPU or parallel layout would run untuned fallback kernels."""
     from vllm.platforms.rocm import on_gfx950
 
     reasons: list[str] = []
     if not on_gfx950():
         reasons.append("the GPU is not gfx950")
-    if parallel_config.tensor_parallel_size not in (4, 8):
+    if parallel_config.tensor_parallel_size not in (2, 4, 8):
         reasons.append(
             f"tensor_parallel_size is {parallel_config.tensor_parallel_size}"
         )
@@ -1449,7 +1557,7 @@ def _fused_shared_experts_tuned(parallel_config: ParallelConfig) -> bool:
     logger.warning_once(
         "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is ignored for GLM-5.3-Flash: "
         "%s. AITER has tuned configs for its fused shared-expert MoE only on "
-        "gfx950 at TP4 and TP8, without data, prefill context or expert "
+        "gfx950 at TP2, TP4 and TP8, without data, prefill context or expert "
         "parallelism. Running the shared experts as a separate MLP.",
         "; ".join(reasons),
     )
@@ -1458,7 +1566,7 @@ def _fused_shared_experts_tuned(parallel_config: ParallelConfig) -> bool:
 
 def _num_fused_shared_experts(n_shared_experts: int | None, enabled: bool) -> int:
     """Expert slots the fused MoE appends for the shared expert; must match the
-    ``num_fused_shared_experts`` that ``FusedMoE`` allocates."""
+    `num_fused_shared_experts` that `FusedMoE` allocates."""
     if not enabled or n_shared_experts is None:
         return 0
     if n_shared_experts > 1:
@@ -1472,7 +1580,7 @@ def _num_fused_shared_experts(n_shared_experts: int | None, enabled: bool) -> in
 
 
 def _fused_shared_expert_name(name: str, n_routed_experts: int) -> str:
-    """Point a checkpoint ``mlp.shared_experts.*`` tensor at the fused MoE's
+    """Point a checkpoint `mlp.shared_experts.*` tensor at the fused MoE's
     shared-expert slot, which follows the routed experts; other names are
     returned unchanged."""
     return name.replace("mlp.shared_experts.", f"mlp.experts.{n_routed_experts}.", 1)
@@ -1515,8 +1623,8 @@ def _dequant_fp8_block(
 ) -> torch.Tensor:
     """Dequantize a block-FP8 (e4m3) weight with per-block scale to BF16.
 
-    Unlike ``scaled_dequantize`` this tolerates a non-divisible (partial last
-    block) shape by zero-padding to a multiple of ``block_size`` before the
+    Unlike `scaled_dequantize` this tolerates a non-divisible (partial last
+    block) shape by zero-padding to a multiple of `block_size` before the
     scale broadcast and trimming back afterwards (e.g. kv_a_proj_with_mqa is
     576 rows = 4*128 + 64).
     """
@@ -1556,10 +1664,10 @@ def _try_load_fp8_attn_proj(
     """Dequantize FP8 q_a_proj / kv_a_proj_with_mqa / o_proj to BF16 on load.
 
     The FP8 checkpoint stores these as block-FP8 (weight + weight_scale_inv),
-    but the model holds them in BF16 (``fused_qkv_a_proj`` is always BF16 via
-    DeepSeekV2FusedQkvAProjLinear; ``o_proj`` is excluded by
+    but the model holds them in BF16 (`fused_qkv_a_proj` is always BF16 via
+    DeepSeekV2FusedQkvAProjLinear; `o_proj` is excluded by
     modules_to_not_convert). When the model target is BF16 (no
-    ``weight_scale_inv`` param) we dequantize; otherwise we return False so the
+    `weight_scale_inv` param) we dequantize; otherwise we return False so the
     normal stacked/direct path loads the FP8 tensor as-is.
     """
     matched = None
