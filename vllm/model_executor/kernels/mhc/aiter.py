@@ -5,6 +5,21 @@ import torch
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+def pack_mhc_fn_bf16(fn: torch.Tensor) -> torch.Tensor:
+    """Pack an FP32 mHC ``fn`` into AITER's BF16 hi/lo layout (same bytes)."""
+    from aiter.ops.mhc import mhc_shuffle_fn
+
+    with torch.no_grad():
+        return mhc_shuffle_fn(fn.detach())
+
+
+def use_mhc_packed_bf16(
+    num_tokens: int, fn_packed: torch.Tensor | None, packed_min_tokens: int
+) -> bool:
+    """Packed BF16 hi/lo weights only for large-M steps; decode keeps FP32."""
+    return fn_packed is not None and 0 < packed_min_tokens <= num_tokens
+
+
 def mhc_pre_aiter(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -18,6 +33,8 @@ def mhc_pre_aiter(
     n_splits: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
+    fn_packed: torch.Tensor | None = None,
+    packed_min_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Forward pass for mHC pre block.
 
@@ -34,6 +51,8 @@ def mhc_pre_aiter(
         n_splits: split-k factor;
         norm_weight: optional RMSNorm weight fused into the pre kernel
         norm_eps: epsilon for the fused RMSNorm when norm_weight is set
+        fn_packed: optional ``fn`` packed by ``pack_mhc_fn_bf16``
+        packed_min_tokens: use fn_packed when num_tokens reaches this (> 0)
 
     Returns:
         post_mix: shape (..., hc_mult), dtype torch.float32
@@ -45,9 +64,12 @@ def mhc_pre_aiter(
     assert hidden_size % 256 == 0
     from vllm._aiter_ops import rocm_aiter_ops
 
+    packed = use_mhc_packed_bf16(
+        residual.shape[:-2].numel(), fn_packed, packed_min_tokens
+    )
     return rocm_aiter_ops.mhc_pre(
         residual,
-        fn,
+        fn_packed if packed else fn,
         hc_scale,
         hc_base,
         rms_eps,
@@ -57,6 +79,7 @@ def mhc_pre_aiter(
         sinkhorn_repeat,
         norm_weight,
         norm_eps,
+        w_preshuffle_bf16=packed,
     )
 
 
@@ -73,6 +96,8 @@ def _mhc_pre_aiter_fake(
     n_splits: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
+    fn_packed: torch.Tensor | None = None,
+    packed_min_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
@@ -325,21 +350,27 @@ def mhc_fused_post_pre_aiter(
     tile_n: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
+    fn_packed: torch.Tensor | None = None,
+    packed_min_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mHC post + next mHC pre on ROCm via AITER.
 
     Returns residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur.
+    ``fn_packed`` / ``packed_min_tokens``: as in :func:`mhc_pre_aiter`.
     """
     hidden_size = residual.shape[-1]
     assert hidden_size % 256 == 0
     from vllm._aiter_ops import rocm_aiter_ops
 
+    packed = use_mhc_packed_bf16(
+        residual.shape[:-2].numel(), fn_packed, packed_min_tokens
+    )
     return rocm_aiter_ops.mhc_fused_post_pre(
         x,
         residual,
         post_layer_mix,
         comb_res_mix,
-        fn,
+        fn_packed if packed else fn,
         hc_scale,
         hc_base,
         rms_eps,
@@ -349,6 +380,7 @@ def mhc_fused_post_pre_aiter(
         sinkhorn_repeat,
         norm_weight,
         norm_eps,
+        w_preshuffle_bf16=packed,
     )
 
 
@@ -369,6 +401,8 @@ def _mhc_fused_post_pre_aiter_fake(
     tile_n: int = 1,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
+    fn_packed: torch.Tensor | None = None,
+    packed_min_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]

@@ -50,6 +50,7 @@ from vllm.model_executor.layers.mhc import (
     MHCPreOp,
     hc_contract,
     hc_expand,
+    mhc_packed_bf16_min_tokens,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -613,6 +614,14 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_post_op = MHCPostOp()
             self.mhc_fused_post_pre_op = MHCFusedPostPreOp()
 
+            # ROCm: packed BF16 hi/lo copies of hc_{attn,ffn}_fn for steps of
+            # at least mhc_packed_min_tokens tokens, built after weight loading
+            # (prepare_mhc_packed_weights). The FP32 tensors stay for decode
+            # and the MonoKernel. None (no memory) when the env var is 0.
+            self.mhc_packed_min_tokens = mhc_packed_bf16_min_tokens()
+            self.register_buffer("hc_attn_fn_packed", None, persistent=False)
+            self.register_buffer("hc_ffn_fn_packed", None, persistent=False)
+
             if vllm_config.kernel_config.enable_jit_warmup:
                 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
                     _HC_PRENORM_GEMM_TILELANG_KERNEL,
@@ -708,6 +717,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 self.hc_attn_base,
                 norm_weight=self.input_layernorm.weight.data,
                 norm_eps=self.input_layernorm.variance_epsilon,
+                hc_fn_packed=self.hc_attn_fn_packed,
             )
         else:
             residual, post, comb, x = self.hc_fused_post_pre(
@@ -720,6 +730,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 self.hc_attn_base,
                 norm_weight=self.input_layernorm.weight.data,
                 norm_eps=self.input_layernorm.variance_epsilon,
+                hc_fn_packed=self.hc_attn_fn_packed,
             )
 
         # Attention needs the full token sequence; mHC above ran on the SP
@@ -746,6 +757,7 @@ class Glm5NextDecoderLayer(nn.Module):
             self.hc_ffn_base,
             norm_weight=self.post_attention_layernorm.weight.data,
             norm_eps=self.post_attention_layernorm.variance_epsilon,
+            hc_fn_packed=self.hc_ffn_fn_packed,
         )
 
         # Fully Connected
@@ -764,6 +776,24 @@ class Glm5NextDecoderLayer(nn.Module):
 
         return x, residual, post, comb
 
+    def prepare_mhc_packed_weights(self) -> None:
+        """Pack hc_{attn,ffn}_fn for AITER's BF16 hi/lo pre GEMM (ROCm, opt-in)."""
+        if not getattr(self, "mhc_packed_min_tokens", 0):
+            return
+        from vllm.model_executor.kernels.mhc.aiter import pack_mhc_fn_bf16
+
+        self.hc_attn_fn_packed = pack_mhc_fn_bf16(self.hc_attn_fn)
+        self.hc_ffn_fn_packed = pack_mhc_fn_bf16(self.hc_ffn_fn)
+
+    def _mhc_packed_kwargs(self, hc_fn_packed: torch.Tensor | None) -> dict:
+        # Only the ROCm AITER mHC ops take these; empty when packing is off.
+        if hc_fn_packed is None:
+            return {}
+        return {
+            "fn_packed": hc_fn_packed,
+            "packed_min_tokens": self.mhc_packed_min_tokens,
+        }
+
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -772,6 +802,7 @@ class Glm5NextDecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        hc_fn_packed: torch.Tensor | None = None,
     ):
         post_mix, res_mix, layer_input = self.mhc_pre_op(
             residual=x,
@@ -785,6 +816,7 @@ class Glm5NextDecoderLayer(nn.Module):
             sinkhorn_repeat=self.mhc_sinkhorn_iterations,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            **self._mhc_packed_kwargs(hc_fn_packed),
         )
         return post_mix, res_mix, layer_input
 
@@ -808,6 +840,7 @@ class Glm5NextDecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        hc_fn_packed: torch.Tensor | None = None,
     ):
         return self.mhc_fused_post_pre_op(
             x=x,
@@ -826,6 +859,7 @@ class Glm5NextDecoderLayer(nn.Module):
             tile_n=1,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            **self._mhc_packed_kwargs(hc_fn_packed),
         )
 
 
@@ -1348,6 +1382,14 @@ class Glm5NextForCausalLM(
         for module in self.modules():
             if isinstance(module, Glm5NextMoE):
                 module.finalize_mega_moe_weights()
+        _prepare_mhc_packed_weights(self)
+
+
+def _prepare_mhc_packed_weights(model: nn.Module) -> None:
+    # Runs after every (re)load, so the packed copies track the FP32 weights.
+    for module in model.modules():
+        if isinstance(module, Glm5NextDecoderLayer):
+            module.prepare_mhc_packed_weights()
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1468,6 +1510,10 @@ class Glm5NextForConditionalGeneration(
         return super().forward(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
+
+    def process_weights_after_loading(self) -> None:
+        # Only the root model's hook runs; cover the wrapped text model.
+        _prepare_mhc_packed_weights(self)
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
